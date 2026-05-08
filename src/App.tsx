@@ -1,4 +1,5 @@
 import { useRef, useEffect, useCallback, useState, useMemo } from 'react';
+import { createClient } from '@supabase/supabase-js';
 import { useNotesStore } from './hooks/useNotesStore';
 import { useAI } from './hooks/useAI';
 import { Sidebar } from './components/Sidebar';
@@ -11,11 +12,85 @@ import { cn, stripHtml, textToHtml, estimateReadTime } from './utils/helpers';
 import { Icons } from './components/icons';
 import { SortBy } from './types';
 
+// Initialize Supabase client
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
+
 function App() {
   const store = useNotesStore();
   const ai = useAI();
   const [showAIPanel, setShowAIPanel] = useState(false);
+  const [user, setUser] = useState<{ email: string; id?: string } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [authMessage, setAuthMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const editorRef = useRef<HTMLDivElement | null>(null);
+
+  // Check for existing session on mount
+  useEffect(() => {
+    if (!supabase) return;
+
+    const getSession = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user) {
+        setUser({ email: session.user.email || '', id: session.user.id });
+      }
+    };
+    getSession();
+
+    // Listen for auth changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (session?.user) {
+        setUser({ email: session.user.email || '', id: session.user.id });
+      } else {
+        setUser(null);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Email/password login handler
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!supabase) {
+      setAuthMessage({ type: 'error', text: 'Supabase not configured. Please add your credentials.' });
+      return;
+    }
+
+    setLoading(true);
+    setAuthMessage(null);
+
+    try {
+      if (authMode === 'login') {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        setAuthMessage({ type: 'success', text: 'Successfully logged in!' });
+      } else {
+        const { error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        setAuthMessage({ type: 'success', text: 'Check your email for the confirmation link!' });
+      }
+      setEmail('');
+      setPassword('');
+    } catch (err: any) {
+      setAuthMessage({ type: 'error', text: err.message || 'Authentication failed' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const logout = async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
+    }
+    setUser(null);
+    setAuthMessage(null);
+    console.log('Logged out');
+  };
 
   const {
     state,
@@ -467,6 +542,105 @@ function App() {
           <Icons.Sparkles className="w-6 h-6" />
         </button>
       )}
+
+      {/* Supabase Email Login - Fixed position in bottom-left corner */}
+      <div className="fixed bottom-6 left-6 z-50 safe-area-inset-bottom">
+        {user ? (
+          <div className="flex items-center gap-3 bg-white dark:bg-surface-dark rounded-xl shadow-lg px-4 py-3 border border-border dark:border-white/10 min-w-[280px]">
+            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-white font-semibold text-sm">
+              {user.email.charAt(0).toUpperCase()}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-text-primary dark:text-white truncate">
+                {user.email}
+              </p>
+              <p className="text-xs text-success">Logged in</p>
+            </div>
+            <button
+              onClick={logout}
+              className="text-xs text-text-secondary dark:text-text-secondary-dark hover:text-danger px-2 py-1 rounded-lg hover:bg-danger/10 transition-colors"
+              title="Sign out"
+            >
+              Sign Out
+            </button>
+          </div>
+        ) : (
+          <div className="bg-white dark:bg-surface-dark rounded-xl shadow-lg p-4 border border-border dark:border-white/10 min-w-[300px]">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-text-primary dark:text-white">
+                {authMode === 'login' ? 'Sign In' : 'Sign Up'}
+              </h3>
+              <button
+                onClick={() => {
+                  setAuthMode(authMode === 'login' ? 'signup' : 'login');
+                  setAuthMessage(null);
+                }}
+                className="text-xs text-accent hover:text-accent-dark transition-colors"
+              >
+                {authMode === 'login' ? 'Need an account?' : 'Have an account?'}
+              </button>
+            </div>
+            
+            <form onSubmit={handleEmailAuth} className="space-y-3">
+              <div>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="Email"
+                  required
+                  className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-white/5 border border-border dark:border-white/10 rounded-lg outline-none focus:ring-2 focus:ring-accent/50 text-text-primary dark:text-white placeholder-text-secondary"
+                />
+              </div>
+              <div>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Password"
+                  required
+                  minLength={6}
+                  className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-white/5 border border-border dark:border-white/10 rounded-lg outline-none focus:ring-2 focus:ring-accent/50 text-text-primary dark:text-white placeholder-text-secondary"
+                />
+              </div>
+              
+              {authMessage && (
+                <div className={`text-xs p-2 rounded-lg ${
+                  authMessage.type === 'success' 
+                    ? 'bg-success/10 text-success' 
+                    : 'bg-danger/10 text-danger'
+                }`}>
+                  {authMessage.text}
+                </div>
+              )}
+              
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full flex items-center justify-center gap-2 bg-accent hover:bg-accent-dark text-white rounded-lg py-2 text-sm font-medium transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {loading ? (
+                  <>
+                    <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Processing...
+                  </>
+                ) : (
+                  authMode === 'login' ? 'Sign In' : 'Sign Up'
+                )}
+              </button>
+            </form>
+            
+            {!supabase && (
+              <p className="mt-3 text-xs text-warning text-center">
+                ⚠️ Configure Supabase credentials to enable login
+              </p>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
