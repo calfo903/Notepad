@@ -42,9 +42,13 @@ export function throttle<T extends (...args: unknown[]) => unknown>(
 
 /**
  * Strip HTML tags and return plain text
+ * SSR-safe: falls back to regex when document is not available
  */
 export function stripHtml(html: string): string {
   if (!html) return '';
+  if (typeof document === 'undefined') {
+    return html.replace(/<[^>]*>/g, '');
+  }
   const tmp = document.createElement('div');
   tmp.innerHTML = html;
   return tmp.textContent || tmp.innerText || '';
@@ -201,4 +205,15 @@ export function safeLocalStorageSet(key: string, value: unknown): void {
   } catch (e) {
     console.error('Failed to save to localStorage:', e);
   }
+}
+
+/**
+ * Sanitize a string for use as a filename
+ * Removes characters that are invalid in filenames on most operating systems
+ */
+export function sanitizeFilename(name: string): string {
+  return name
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, '_')
+    .substring(0, 100);
 }

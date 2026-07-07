@@ -1,20 +1,20 @@
-interface PuterAIMessage {
+export interface PuterAIMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
 }
 
-interface PuterAIChatOptions {
+export interface PuterAIChatOptions {
   stream?: boolean;
 }
 
-interface PuterAIResponse {
+export interface PuterAIResponse {
   message?: {
     content: string | Array<{ type: string; text?: string }>;
   };
   toString(): string;
 }
 
-interface PuterAIStreamChunk {
+export interface PuterAIStreamChunk {
   text?: string;
 }
 

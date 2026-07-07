@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo } from 'react';
+import { memo, useCallback, useMemo, useState } from 'react';
 import { Note } from '../types';
 import { cn, truncateContent, formatRelativeDate } from '../utils/helpers';
 import { Icons } from './icons';
@@ -12,6 +12,7 @@ interface NoteListProps {
   onTogglePin: (id: string) => void;
   onRestoreNote?: (id: string) => void;
   onArchiveNote?: (id: string) => void;
+  onReorderNotes?: (oldIndex: number, newIndex: number) => void;
 }
 
 interface NoteItemProps {
@@ -23,6 +24,12 @@ interface NoteItemProps {
   onTogglePin: () => void;
   onRestore?: () => void;
   onArchive?: () => void;
+  isDraggingOver?: boolean;
+  onDragStart?: (e: React.DragEvent) => void;
+  onDragOver?: (e: React.DragEvent) => void;
+  onDragLeave?: (e: React.DragEvent) => void;
+  onDrop?: (e: React.DragEvent) => void;
+  onDragEnd?: (e: React.DragEvent) => void;
 }
 
 const NoteItem = memo(function NoteItem({
@@ -34,6 +41,12 @@ const NoteItem = memo(function NoteItem({
   onTogglePin,
   onRestore,
   onArchive,
+  isDraggingOver = false,
+  onDragStart,
+  onDragOver,
+  onDragLeave,
+  onDrop,
+  onDragEnd,
 }: NoteItemProps) {
   const preview = useMemo(() => truncateContent(note.content, 100), [note.content]);
   const dateStr = useMemo(() => formatRelativeDate(note.updatedAt), [note.updatedAt]);
@@ -41,16 +54,27 @@ const NoteItem = memo(function NoteItem({
   const isTrash = activeFolder === 'trash';
   const isArchive = activeFolder === 'archive';
   const showActions = !isTrash && !isArchive;
+  const draggable = !!(onDragStart && onDragOver && onDragLeave && onDrop && onDragEnd);
 
   return (
-    <li className="group">
+    <li
+      className="group"
+      draggable={draggable}
+      onDragStart={onDragStart}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+      onDragEnd={onDragEnd}
+    >
       <button
         onClick={onSelect}
         className={cn(
           'w-full text-left px-4 py-3.5 transition-all duration-150 hover:bg-sidebar-hover border-l-2',
           isActive
             ? 'bg-sidebar-active border-accent'
-            : 'border-transparent'
+            : 'border-transparent',
+          isDraggingOver && 'bg-sidebar-hover border-accent/30',
+          draggable && 'cursor-grab active:cursor-grabbing'
         )}
       >
         <div className="flex items-start gap-2">
@@ -155,7 +179,10 @@ export const NoteList = memo(function NoteList({
   onTogglePin,
   onRestoreNote,
   onArchiveNote,
+  onReorderNotes,
 }: NoteListProps) {
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+
   const handleSelect = useCallback(
     (id: string) => () => onSelectNote(id),
     [onSelectNote]
@@ -165,7 +192,7 @@ export const NoteList = memo(function NoteList({
     (id: string) => () => onDeleteNote(id),
     [onDeleteNote]
   );
-  
+
   const handleTogglePin = useCallback(
     (id: string) => () => onTogglePin(id),
     [onTogglePin]
@@ -180,6 +207,48 @@ export const NoteList = memo(function NoteList({
     (id: string) => () => onArchiveNote?.(id),
     [onArchiveNote]
   );
+
+  // Drag and drop handlers
+  const handleDragStart = useCallback(
+    (index: number) => (e: React.DragEvent) => {
+      if (e.dataTransfer) {
+        e.dataTransfer.setData('text/plain', index.toString());
+        e.dataTransfer.effectAllowed = 'move';
+      }
+    },
+    []
+  );
+
+  const handleDragOver = useCallback(
+    (index: number) => (e: React.DragEvent) => {
+      e.preventDefault();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = 'move';
+      }
+      setDragOverIndex(index);
+    },
+    []
+  );
+
+  const handleDragLeave = useCallback(() => {
+    setDragOverIndex(null);
+  }, []);
+
+  const handleDrop = useCallback(
+    (index: number) => (e: React.DragEvent) => {
+      e.preventDefault();
+      setDragOverIndex(null);
+      const draggedIndex = Number(e.dataTransfer?.getData('text/plain'));
+      if (draggedIndex !== index && onReorderNotes) {
+        onReorderNotes(draggedIndex, index);
+      }
+    },
+    [onReorderNotes]
+  );
+
+  const handleDragEnd = useCallback(() => {
+    setDragOverIndex(null);
+  }, []);
 
   if (notes.length === 0) {
     const emptyStates = {
@@ -202,7 +271,7 @@ export const NoteList = memo(function NoteList({
   return (
     <div className="flex-1 overflow-y-auto scrollbar-thin">
       <ul className="divide-y divide-white/5">
-        {notes.map((note) => (
+        {notes.map((note, index) => (
           <NoteItem
             key={note.id}
             note={note}
@@ -213,6 +282,12 @@ export const NoteList = memo(function NoteList({
             onTogglePin={handleTogglePin(note.id)}
             onRestore={onRestoreNote ? handleRestore(note.id) : undefined}
             onArchive={onArchiveNote ? handleArchive(note.id) : undefined}
+            isDraggingOver={dragOverIndex === index}
+            onDragStart={onReorderNotes ? handleDragStart(index) : undefined}
+            onDragOver={onReorderNotes ? handleDragOver(index) : undefined}
+            onDragLeave={onReorderNotes ? handleDragLeave : undefined}
+            onDrop={onReorderNotes ? handleDrop(index) : undefined}
+            onDragEnd={onReorderNotes ? handleDragEnd : undefined}
           />
         ))}
       </ul>

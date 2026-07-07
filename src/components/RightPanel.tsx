@@ -1,4 +1,4 @@
-import { memo, useCallback, useState } from 'react';
+import { memo, useCallback, useState, useMemo } from 'react';
 import { Note, Folder } from '../types';
 import { cn, formatFullDate } from '../utils/helpers';
 import { Icons } from './icons';
@@ -6,6 +6,7 @@ import { Icons } from './icons';
 interface RightPanelProps {
   note: Note;
   folders: Folder[];
+  allTags?: string[];
   onUpdate: (id: string, updates: Partial<Note>) => void;
   onClose: () => void;
 }
@@ -13,31 +14,59 @@ interface RightPanelProps {
 export const RightPanel = memo(function RightPanel({
   note,
   folders,
+  allTags = [],
   onUpdate,
   onClose,
 }: RightPanelProps) {
   const [tagInput, setTagInput] = useState('');
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
 
   const writableFolders = folders.filter(
     (f) => !['all', 'favorites', 'trash', 'archive'].includes(f.id)
   );
 
-  const addTag = useCallback(() => {
-    const tag = tagInput.trim();
-    if (tag && !note.tags.includes(tag)) {
-      onUpdate(note.id, { tags: [...note.tags, tag] });
-      setTagInput('');
-    }
-  }, [tagInput, note.id, note.tags, onUpdate]);
+  // Get unique tags not already in the note
+  const availableTags = useMemo(() => {
+    return Array.from(new Set(allTags)).filter(
+      (tag) => !note.tags.includes(tag) && tag.toLowerCase().includes(tagInput.toLowerCase())
+    );
+  }, [allTags, note.tags, tagInput]);
 
-  const handleTagKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        addTag();
+  const addTag = useCallback(
+    (tag?: string) => {
+      const finalTag = tag || tagInput.trim();
+      if (finalTag && !note.tags.includes(finalTag)) {
+        onUpdate(note.id, { tags: [...note.tags, finalTag] });
+        setTagInput('');
+        setShowSuggestions(false);
       }
     },
-    [addTag]
+    [tagInput, note.id, note.tags, onUpdate]
+  );
+
+  const handleTagKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (showSuggestions && availableTags.length > 0) {
+          addTag(availableTags[selectedSuggestionIndex]);
+        } else {
+          addTag();
+        }
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedSuggestionIndex((prev) =>
+          Math.min(prev + 1, availableTags.length - 1)
+        );
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedSuggestionIndex((prev) => Math.max(prev - 1, 0));
+      } else if (e.key === 'Escape') {
+        setShowSuggestions(false);
+      }
+    },
+    [showSuggestions, availableTags, selectedSuggestionIndex, addTag]
   );
 
   const removeTag = useCallback(
@@ -118,22 +147,44 @@ export const RightPanel = memo(function RightPanel({
               </span>
             ))}
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 relative">
             <input
               type="text"
               value={tagInput}
-              onChange={(e) => setTagInput(e.target.value)}
+              onChange={(e) => {
+                setTagInput(e.target.value);
+                setShowSuggestions(e.target.value.trim().length > 0);
+              }}
               onKeyDown={handleTagKeyDown}
+              onFocus={() => tagInput.length > 0 && setShowSuggestions(true)}
+              onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
               placeholder="Add tag..."
               className="flex-1 bg-gray-50 dark:bg-white/5 border border-border dark:border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent transition-colors"
             />
             <button
-              onClick={addTag}
+              onClick={() => addTag()}
               disabled={!tagInput.trim()}
               className="px-3 py-2 bg-accent/10 text-accent rounded-lg text-sm font-medium hover:bg-accent/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Add
             </button>
+            {showSuggestions && availableTags.length > 0 && (
+              <ul className="absolute top-full left-0 mt-1 w-full max-h-40 overflow-y-auto bg-white dark:bg-editor-dark border border-border dark:border-white/10 rounded-lg shadow-lg z-50 py-1 animate-fadeIn">
+                {availableTags.map((tag, index) => (
+                  <li
+                    key={tag}
+                    onClick={() => addTag(tag)}
+                    className={cn(
+                      'px-3 py-2 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-white/5 transition-colors',
+                      index === selectedSuggestionIndex &&
+                        'bg-accent/10 dark:bg-accent/20 text-accent dark:text-accent-light'
+                    )}
+                  >
+                    {tag}
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         </section>
 

@@ -21,6 +21,7 @@ function App() {
     state,
     filteredNotes,
     activeNote,
+    allTags,
     folderNoteCounts,
     createNote,
     updateNote,
@@ -31,6 +32,7 @@ function App() {
     emptyTrash,
     duplicateNote,
     exportNote,
+    reorderNotes,
     setActiveNote,
     setActiveFolder,
     setSearchQuery,
@@ -76,7 +78,7 @@ function App() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [createNote, closeMobileOverlays, showAIPanel]);
+  }, [createNote, closeMobileOverlays, showAIPanel, setShowAIPanel]);
 
   // Format command handler
   const handleFormat = useCallback(
@@ -94,7 +96,7 @@ function App() {
     if (activeNote) {
       ai.updateNoteContext(activeNote.title, activeNote.tags);
     }
-  }, [activeNote?.id, activeNote?.title, activeNote?.tags, ai.updateNoteContext]);
+  }, [activeNote, ai]);
 
   // Handle inserting AI-generated content
   const handleInsertContent = useCallback(
@@ -109,7 +111,7 @@ function App() {
         editorRef.current.innerHTML = newContent;
       }
     },
-    [activeNote, updateNote]
+    [activeNote, updateNote, editorRef]
   );
 
   // Auto-select first note if none selected
@@ -220,6 +222,7 @@ function App() {
             onTogglePin={togglePin}
             onRestoreNote={restoreNote}
             onArchiveNote={archiveNote}
+            onReorderNotes={reorderNotes}
           />
         </div>
       )}
@@ -282,6 +285,7 @@ function App() {
                   onTogglePin={togglePin}
                   onRestoreNote={restoreNote}
                   onArchiveNote={archiveNote}
+                  onReorderNotes={reorderNotes}
                 />
               </div>
               <div className="p-3 border-t border-white/5">
@@ -429,6 +433,7 @@ function App() {
           <RightPanel
             note={activeNote}
             folders={state.folders}
+            allTags={allTags}
             onUpdate={updateNote}
             onClose={toggleRightPanel}
           />

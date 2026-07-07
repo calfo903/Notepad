@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useMemo } from 'react';
+import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import {
   Note,
   DEFAULT_FOLDERS,
@@ -19,6 +19,7 @@ import {
   htmlToMarkdown,
   safeLocalStorageGet,
   safeLocalStorageSet,
+  sanitizeFilename,
 } from '../utils/helpers';
 
 // ============================================================================
@@ -177,6 +178,13 @@ export function useNotesStore() {
   const [state, setState] = useState<AppState>(getInitialState);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Cleanup timeout on unmount
+  useEffect(() => () => {
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+    }
+  }, []);
+
   // Save to localStorage with debounce
   const saveToStorage = useCallback((newState: AppState) => {
     if (saveTimeoutRef.current) {
@@ -257,6 +265,7 @@ export function useNotesStore() {
     });
 
     return filtered;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.notes, state.activeFolder, state.searchQuery, state.sortBy, state.sortOrder]);
 
   const activeNote = useMemo(() => {
@@ -283,6 +292,15 @@ export function useNotesStore() {
     });
     return counts;
   }, [state.folders, getFolderNoteCount]);
+
+  // Get all unique tags from all notes
+  const allTags = useMemo(() => {
+    const tagsSet = new Set<string>();
+    state.notes.forEach((note) => {
+      note.tags.forEach((tag) => tagsSet.add(tag));
+    });
+    return Array.from(tagsSet);
+  }, [state.notes]);
 
   // ========== Actions ==========
 
@@ -409,6 +427,7 @@ export function useNotesStore() {
       let filename: string;
       let mimeType: string;
 
+      const safeTitle = sanitizeFilename(note.title || 'note');
       switch (format) {
         case 'html':
           content = `<!DOCTYPE html>
@@ -419,17 +438,17 @@ export function useNotesStore() {
 ${note.content}
 </body>
 </html>`;
-          filename = `${note.title || 'note'}.html`;
+          filename = `${safeTitle}.html`;
           mimeType = 'text/html';
           break;
         case 'markdown':
           content = `# ${note.title}\n\n${htmlToMarkdown(note.content)}`;
-          filename = `${note.title || 'note'}.md`;
+          filename = `${safeTitle}.md`;
           mimeType = 'text/markdown';
           break;
         default:
           content = `${note.title}\n\n${stripHtml(note.content)}`;
-          filename = `${note.title || 'note'}.txt`;
+          filename = `${safeTitle}.txt`;
           mimeType = 'text/plain';
       }
 
@@ -504,6 +523,19 @@ ${note.content}
     [updateState]
   );
 
+  const reorderNotes = useCallback(
+    (oldIndex: number, newIndex: number) => {
+      if (oldIndex === newIndex) return;
+      updateState((prev) => {
+        const newNotes = [...prev.notes];
+        const [removed] = newNotes.splice(oldIndex, 1);
+        newNotes.splice(newIndex, 0, removed);
+        return { notes: newNotes };
+      });
+    },
+    [updateState]
+  );
+
   const toggleMobileMenu = useCallback(() => {
     updateState((prev) => ({ 
       showMobileMenu: !prev.showMobileMenu,
@@ -528,6 +560,7 @@ ${note.content}
     filteredNotes,
     activeNote,
     folderNoteCounts,
+    allTags,
     // Note Actions
     createNote,
     updateNote,
@@ -538,6 +571,7 @@ ${note.content}
     emptyTrash,
     duplicateNote,
     exportNote,
+    reorderNotes,
     // UI Actions
     setActiveNote,
     setActiveFolder,

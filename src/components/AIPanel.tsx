@@ -168,7 +168,7 @@ export const AIPanel = memo(function AIPanel({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-y-0 right-0 w-full sm:w-96 bg-white dark:bg-editor-dark border-l border-border dark:border-white/10 shadow-2xl z-50 flex flex-col animate-slideInRight safe-area-inset-bottom">
+    <div className="fixed inset-y-0 right-0 w-full sm:w-[340px] md:w-[380px] bg-white dark:bg-editor-dark border-l border-border dark:border-white/10 shadow-2xl z-50 flex flex-col animate-slideInRight safe-area-inset-bottom">
       {/* Header */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-border dark:border-white/5 bg-gradient-to-r from-purple-500/10 to-blue-500/10 flex-shrink-0">
         <div className="flex items-center gap-3">

@@ -1,6 +1,8 @@
 import { useState, useCallback, useRef } from 'react';
 import { AIMessage, AIMemory, AIQuickAction, AIGenerateType, AI_MEMORY_KEY } from '../types';
 import { generateId, safeLocalStorageGet, safeLocalStorageSet } from '../utils/helpers';
+import type { PuterAIMessage, PuterAIChatOptions, PuterAIResponse, PuterAIStreamChunk } from '../puter.d';
+
 
 const MAX_HISTORY = 20;
 
@@ -155,14 +157,15 @@ export function useAI() {
         let fullResponse = '';
 
         if (options?.stream) {
-          const response = await window.puter.ai.chat(messages, { stream: true });
+          const response: PuterAIResponse | AsyncIterable<PuterAIStreamChunk> = await window.puter.ai.chat(
+            messages as PuterAIMessage[],
+            { stream: true } as PuterAIChatOptions
+          );
 
           // Handle streaming response - check if it's an async iterable
           try {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const asyncResponse = response as any;
-            if (asyncResponse && typeof asyncResponse[Symbol.asyncIterator] === 'function') {
-              for await (const chunk of asyncResponse) {
+            if (response && typeof (response as AsyncIterable<PuterAIStreamChunk>)[Symbol.asyncIterator] === 'function') {
+              for await (const chunk of response as AsyncIterable<PuterAIStreamChunk>) {
                 if (abortRef.current) break;
                 const text = chunk?.text || '';
                 fullResponse += text;
@@ -170,12 +173,14 @@ export function useAI() {
               }
             } else {
               // Fallback for non-streaming response
-              if (asyncResponse?.message?.content) {
-                fullResponse = typeof asyncResponse.message.content === 'string' 
-                  ? asyncResponse.message.content 
-                  : asyncResponse.message.content.map((c: { text?: string }) => c.text || '').join('');
+              const nonStreamResponse = response as PuterAIResponse;
+              if (nonStreamResponse?.message?.content) {
+                const content = nonStreamResponse.message.content;
+                fullResponse = typeof content === 'string' 
+                  ? content 
+                  : content.map((c: { text?: string }) => c.text || '').join('');
               } else {
-                fullResponse = asyncResponse?.toString() || '';
+                fullResponse = nonStreamResponse?.toString() || '';
               }
             }
           } catch {
@@ -183,14 +188,14 @@ export function useAI() {
             fullResponse = 'Sorry, there was an error processing the response.';
           }
         } else {
-          const response = await window.puter.ai.chat(messages);
-          const result = response as { message?: { content: string | Array<{ text?: string }> }; toString(): string };
-          if (result?.message?.content) {
-            fullResponse = typeof result.message.content === 'string' 
-              ? result.message.content 
-              : result.message.content.map(c => c.text || '').join('');
+          const response: PuterAIResponse = await window.puter.ai.chat(messages as PuterAIMessage[]);
+          if (response?.message?.content) {
+            const content = response.message.content;
+            fullResponse = typeof content === 'string' 
+              ? content 
+              : content.map((c: { text?: string }) => c.text || '').join('');
           } else {
-            fullResponse = result?.toString() || '';
+            fullResponse = response?.toString() || '';
           }
         }
 
@@ -203,6 +208,7 @@ export function useAI() {
         };
         addToHistory(assistantMsg);
 
+        abortRef.current = false;
         setIsLoading(false);
         setStreamingResponse('');
         return fullResponse;
@@ -258,6 +264,7 @@ export function useAI() {
   const stopGeneration = useCallback(() => {
     abortRef.current = true;
     setIsLoading(false);
+    setStreamingResponse('');
   }, []);
 
   const clearHistory = useCallback(() => {
