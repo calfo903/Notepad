@@ -2,7 +2,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import { viteSingleFile } from "vite-plugin-singlefile";
 import type { IncomingMessage, ServerResponse } from "http";
 import { handleChat } from "./server/chatHandler";
@@ -12,6 +12,11 @@ import {
   handleSession,
 } from "./server/authHandler";
 import { handleListNotes, handleSync } from "./server/syncHandler";
+import {
+  handleAuthEvents,
+  handleDeleteAccount,
+  handleSearchNotes,
+} from "./server/accountHandler";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,6 +25,29 @@ const __dirname = path.dirname(__filename);
 // HMR client dials the proxy instead of the Vite port. Local dev leaves it unset.
 const hmrClientPort = process.env.VITE_HMR_CLIENT_PORT;
 
+/**
+ * Bridge `.env` / `.env.local` into the API middleware.
+ *
+ * Vite hands `VITE_`-prefixed vars to `import.meta.env` on the client, but the
+ * Edge handlers mounted below run in Node and read bare `process.env`, which
+ * Vite never populates from `.env` files. Without this bridge every server-side
+ * secret reads as `undefined` in development, so auth, sync and chat each report
+ * "not configured" even when `.env.local` is correct.
+ *
+ * A real environment variable always wins, so a deploy-time value can never be
+ * masked by a stale local file.
+ */
+function loadServerEnv(mode: string): void {
+  // The empty prefix disables Vite's `VITE_` filter so server-only keys
+  // (GOOGLE_CLIENT_ID, SESSION_SECRET, DATABASE_URL, OPENROUTER_API_KEY) are
+  // returned too. They stay server-side: nothing here reaches the bundle.
+  const loaded = loadEnv(mode, __dirname, "");
+
+  for (const [key, value] of Object.entries(loaded)) {
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+
 /** Route table mirroring the Vercel `api/` filesystem layout. */
 const API_ROUTES: ReadonlyMap<string, (request: Request) => Promise<Response>> = new Map([
   ["/api/chat", handleChat],
@@ -27,7 +55,10 @@ const API_ROUTES: ReadonlyMap<string, (request: Request) => Promise<Response>> =
   ["/api/auth/session", handleSession],
   ["/api/auth/logout", handleLogout],
   ["/api/notes/sync", handleSync],
+  ["/api/notes/search", handleSearchNotes],
   ["/api/notes", handleListNotes],
+  ["/api/auth/events", handleAuthEvents],
+  ["/api/auth/account", handleDeleteAccount],
 ]);
 
 /**
@@ -140,21 +171,27 @@ async function serveApi(
 }
 
 // https://vite.dev/config/
-export default defineConfig({
-  plugins: [react(), tailwindcss(), viteSingleFile(), apiEndpointPlugin()],
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "src"),
+export default defineConfig(({ mode }) => {
+  // Before the plugins are constructed: the handlers close over process.env at
+  // request time, but the config phase is the earliest point `mode` is known.
+  loadServerEnv(mode);
+
+  return {
+    plugins: [react(), tailwindcss(), viteSingleFile(), apiEndpointPlugin()],
+    resolve: {
+      alias: {
+        "@": path.resolve(__dirname, "src"),
+      },
     },
-  },
-  server: {
-    host: true,
-    port: 5173,
-    strictPort: true,
-    // Accept requests addressed to any hostname (preview/proxy domains, LAN IPs).
-    allowedHosts: true,
-    hmr: hmrClientPort
-      ? { clientPort: Number(hmrClientPort), protocol: "wss" }
-      : undefined,
-  },
+    server: {
+      host: true,
+      port: 5173,
+      strictPort: true,
+      // Accept requests addressed to any hostname (preview/proxy domains, LAN IPs).
+      allowedHosts: true,
+      hmr: hmrClientPort
+        ? { clientPort: Number(hmrClientPort), protocol: "wss" }
+        : undefined,
+    },
+  };
 });

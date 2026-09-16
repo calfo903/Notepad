@@ -1,12 +1,8 @@
 // @vitest-environment node
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { PGlite } from '@electric-sql/pglite';
-import { drizzle, type PgliteDatabase } from 'drizzle-orm/pglite';
 import { eq } from 'drizzle-orm';
-import * as schema from './schema';
 import { notes } from './schema';
+import { createTestDatabase, type TestDatabase } from './testDatabase';
 import { listAll, MAX_CONTENT_CHARS, PayloadTooLargeError, syncAll, type NoteInput } from './syncRepo';
 
 /**
@@ -15,14 +11,13 @@ import { listAll, MAX_CONTENT_CHARS, PayloadTooLargeError, syncAll, type NoteInp
  * timestamptz round-tripping and array columns.
  */
 
-const MIGRATION_PATH = fileURLToPath(new URL('./migrations/0000_init.sql', import.meta.url));
-const MIGRATION_SQL = readFileSync(MIGRATION_PATH, 'utf8');
-
 const USER_A = 'google-sub-user-a';
 const USER_B = 'google-sub-user-b';
 
-let client: PGlite;
-let db: PgliteDatabase<typeof schema>;
+// Assigned in beforeAll; the `!` is the standard way to tell TS that a
+// vitest lifecycle hook runs before the test bodies.
+let harness!: TestDatabase;
+let db!: TestDatabase['db'];
 
 // One engine for the whole file: PGlite boots a WASM Postgres, which costs
 // ~1.7s per instance. Rows are truncated between tests instead.
@@ -33,6 +28,7 @@ function noteInput(overrides: Partial<NoteInput> = {}): NoteInput {
     id: 'note-1',
     title: 'Untitled',
     content: '<p>body</p>',
+    searchText: 'untitled body',
     folderId: 'all',
     tags: [],
     pinned: false,
@@ -48,27 +44,26 @@ function noteInput(overrides: Partial<NoteInput> = {}): NoteInput {
 }
 
 beforeAll(async () => {
-  client = new PGlite();
-  await client.exec(MIGRATION_SQL);
-  db = drizzle(client, { schema });
+  harness = await createTestDatabase();
+  db = harness.db;
 });
 
 beforeEach(async () => {
-  await client.exec('TRUNCATE "notes", "folders"');
+  await harness.truncate();
 });
 
 afterAll(async () => {
-  await client.close();
+  await harness.close();
 });
 
 describe('schema migration', () => {
-  it('creates both tables with their indexes', async () => {
-    const tables = await client.query<{ tablename: string }>(
+  it('creates every table with its indexes', async () => {
+    const tables = await harness.client.query<{ tablename: string }>(
       `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`
     );
-    expect(tables.rows.map((row) => row.tablename)).toEqual(['folders', 'notes']);
+    expect(tables.rows.map((row) => row.tablename)).toEqual(['auth_events', 'folders', 'notes']);
 
-    const indexes = await client.query<{ indexname: string }>(
+    const indexes = await harness.client.query<{ indexname: string }>(
       `SELECT indexname FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname`
     );
     const names = indexes.rows.map((row) => row.indexname);

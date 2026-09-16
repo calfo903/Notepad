@@ -2,9 +2,7 @@ import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import {
   Note,
   Folder,
-  DEFAULT_FOLDERS,
   STORAGE_KEY,
-  Theme,
   ViewMode,
   SortBy,
   SortOrder,
@@ -23,6 +21,7 @@ import {
   sanitizeFilename,
 } from '../utils/helpers';
 import { escapeHtml, sanitizeHtml } from '../utils/sanitize';
+import { hydrateAppState } from '../utils/appStateSchema';
 
 // ============================================================================
 // Initial State
@@ -149,23 +148,42 @@ function getSampleNotes(): Note[] {
   });
 }
 
+/**
+ * Build initial state from persisted storage.
+ *
+ * Everything goes through `hydrateAppState`, which validates each entry rather
+ * than trusting the stored shape. localStorage is writable by other tabs and
+ * extensions, and a single malformed note used to be enough to throw during
+ * render and blank the whole app.
+ */
 function getInitialState(): AppState {
-  const saved = safeLocalStorageGet<Partial<AppState>>(STORAGE_KEY, {});
-  
-  const notes = saved.notes?.length ? saved.notes : getSampleNotes();
-  
+  const { state, droppedNotes, droppedFolders, wasCorrupt } = hydrateAppState(
+    safeLocalStorageGet<unknown>(STORAGE_KEY, null)
+  );
+
+  if (wasCorrupt) {
+    console.warn('[noteflow] persisted state was unreadable; started from defaults.');
+  } else if (droppedNotes > 0 || droppedFolders > 0) {
+    // Repair, not silent data loss: say what was discarded.
+    console.warn(
+      `[noteflow] discarded ${droppedNotes} malformed note(s) and ${droppedFolders} malformed folder(s) during load.`
+    );
+  }
+
+  const notes = state.notes.length > 0 ? state.notes : getSampleNotes();
+
   return {
     notes,
-    folders: saved.folders || DEFAULT_FOLDERS,
-    activeNoteId: saved.activeNoteId || (notes[0]?.id ?? null),
-    activeFolder: saved.activeFolder || 'all',
+    folders: state.folders,
+    activeNoteId: state.activeNoteId ?? (notes[0]?.id ?? null),
+    activeFolder: state.activeFolder,
     searchQuery: '',
-    viewMode: (saved.viewMode as ViewMode) || 'editor',
-    theme: (saved.theme as Theme) || 'dark',
-    showRightPanel: saved.showRightPanel ?? false,
-    sidebarCollapsed: saved.sidebarCollapsed ?? false,
-    sortBy: (saved.sortBy as SortBy) || 'updatedAt',
-    sortOrder: (saved.sortOrder as SortOrder) || 'desc',
+    viewMode: state.viewMode,
+    theme: state.theme,
+    showRightPanel: state.showRightPanel,
+    sidebarCollapsed: state.sidebarCollapsed,
+    sortBy: state.sortBy,
+    sortOrder: state.sortOrder,
     saveStatus: 'saved',
     showMobileMenu: false,
     showMobileNoteList: false,
@@ -179,6 +197,15 @@ function getInitialState(): AppState {
 export function useNotesStore() {
   const [state, setState] = useState<AppState>(getInitialState);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * True between scheduling a debounced write and it landing.
+   *
+   * A second open tab fires `storage` here; if this tab is mid-write, adopting
+   * the other tab's snapshot and then flushing would silently overwrite it. The
+   * pending write wins instead, which is the same last-write-wins rule the
+   * server applies.
+   */
+  const hasPendingWriteRef = useRef(false);
 
   // Cleanup timeout on unmount
   useEffect(() => () => {
@@ -187,12 +214,57 @@ export function useNotesStore() {
     }
   }, []);
 
+  /**
+   * Reconcile with other tabs.
+   *
+   * Without this, two open tabs diverge: each holds its own in-memory copy and
+   * the last one to save silently discards everything the other did.
+   */
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY) return;
+      if (hasPendingWriteRef.current) return;
+      // A null newValue means another tab cleared storage; nothing to adopt.
+      if (event.newValue === null) return;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(event.newValue);
+      } catch {
+        return;
+      }
+
+      const { state: incoming, wasCorrupt } = hydrateAppState(parsed);
+      if (wasCorrupt) return;
+
+      setState((prev) => ({
+        ...prev,
+        notes: incoming.notes,
+        folders: incoming.folders,
+        activeNoteId: incoming.activeNoteId ?? (incoming.notes[0]?.id ?? null),
+        activeFolder: incoming.activeFolder,
+        viewMode: incoming.viewMode,
+        theme: incoming.theme,
+        sortBy: incoming.sortBy,
+        sortOrder: incoming.sortOrder,
+        // Transient UI state stays local: another tab's search box and mobile
+        // menu are not this tab's business.
+      }));
+    };
+
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
   // Save to localStorage with debounce
   const saveToStorage = useCallback((newState: AppState) => {
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
     }
-    
+
+    hasPendingWriteRef.current = true;
     saveTimeoutRef.current = setTimeout(() => {
       const toSave = {
         notes: newState.notes,
@@ -207,6 +279,7 @@ export function useNotesStore() {
         sortOrder: newState.sortOrder,
       };
       safeLocalStorageSet(STORAGE_KEY, toSave);
+      hasPendingWriteRef.current = false;
       setState((prev) => ({ ...prev, saveStatus: 'saved' }));
     }, 500);
   }, []);

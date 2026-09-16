@@ -4,6 +4,8 @@ import {
   collectChangedNotes,
   mergeFolders,
   mergeNotes,
+  prepareNotesForSync,
+  toSyncNote,
   type RemoteNote,
 } from '../services/sync/merge';
 import type { Folder } from '../types';
@@ -185,5 +187,62 @@ describe('collectChangedFolders', () => {
     );
 
     expect(result).toEqual([]);
+  });
+});
+
+describe('toSyncNote — search text projection', () => {
+  it('combines title and stripped body, lower-cased', () => {
+    const result = toSyncNote(note({ title: 'Meeting Notes', content: '<p>Quarterly Budget</p>' }));
+
+    expect(result.searchText).toBe('meeting notes quarterly budget');
+  });
+
+  it('strips tags rather than indexing markup', () => {
+    const result = toSyncNote(note({ title: 'A', content: '<h1>Head</h1><ul><li>one</li><li>two</li></ul>' }));
+
+    expect(result.searchText).not.toContain('<');
+    expect(result.searchText).toContain('head');
+    expect(result.searchText).toContain('one');
+  });
+
+  it('collapses the whitespace newlines leave behind', () => {
+    const result = toSyncNote(note({ title: 'A', content: '<p>one</p>\n<p>two</p>' }));
+
+    expect(result.searchText).toBe('a one two');
+  });
+
+  it('handles an empty note without producing stray spaces', () => {
+    expect(toSyncNote(note({ title: '', content: '' })).searchText).toBe('');
+  });
+
+  it('keeps every original field intact', () => {
+    const original = note({ id: 'keep-me', title: 'T' });
+    const result = toSyncNote(original);
+
+    expect(result.id).toBe('keep-me');
+    expect(result.content).toBe(original.content);
+  });
+
+  it('does not mutate its input', () => {
+    const original = note({ id: 'n1', title: 'T', content: '<p>x</p>' });
+    const before = JSON.stringify(original);
+
+    toSyncNote(original);
+
+    expect(JSON.stringify(original)).toBe(before);
+  });
+
+  it('maps a whole collection', () => {
+    const results = prepareNotesForSync([
+      note({ id: 'a', title: 'Alpha' }),
+      note({ id: 'b', title: 'Beta' }),
+    ]);
+
+    expect(results).toHaveLength(2);
+    expect(results.map((row) => row.searchText)).toEqual(['alpha', 'beta']);
+  });
+
+  it('maps an empty collection to an empty collection', () => {
+    expect(prepareNotesForSync([])).toEqual([]);
   });
 });

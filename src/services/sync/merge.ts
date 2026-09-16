@@ -1,3 +1,4 @@
+import { stripHtml } from '../../utils/helpers';
 import type { Folder, Note } from '../../types';
 
 /**
@@ -111,6 +112,25 @@ export function collectChangedNotes(
 ): readonly Note[] {
   if (lastSyncedAt === null) return [...notes];
   return notes.filter((note) => note.updatedAt > lastSyncedAt);
+}
+
+/**
+ * A note ready to push: the stored note plus the derived search text.
+ *
+ * `searchText` is computed here rather than on the server because Edge Functions
+ * have no DOM. Stripping HTML with a regex on the server would be wrong in
+ * exactly the cases that matter (entities, `<script>`, nested tags), and the
+ * client already runs DOMPurify and has a real parser.
+ */
+export type SyncNote = Note & { readonly searchText: string };
+
+export function toSyncNote(note: Note): SyncNote {
+  const plainText = stripHtml(note.content).replace(/\s+/g, ' ');
+  return { ...note, searchText: `${note.title} ${plainText}`.toLowerCase().trim() };
+}
+
+export function prepareNotesForSync(notes: readonly Note[]): readonly SyncNote[] {
+  return notes.map(toSyncNote);
 }
 
 export function collectChangedFolders(

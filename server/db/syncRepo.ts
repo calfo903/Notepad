@@ -99,6 +99,10 @@ export async function syncAll(
         set: {
           title: sql`excluded.title`,
           content: sql`excluded.content`,
+          // Must be updated alongside `content`: a note edited on another device
+          // would otherwise keep its stale search text and stay findable by
+          // words it no longer contains.
+          searchText: sql`excluded.search_text`,
           folderId: sql`excluded.folder_id`,
           tags: sql`excluded.tags`,
           pinned: sql`excluded.pinned`,

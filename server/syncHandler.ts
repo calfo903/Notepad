@@ -16,6 +16,10 @@ const noteInputSchema = z.object({
   id: z.string().min(1).max(64),
   title: z.string().max(2_000).default(''),
   content: z.string().max(MAX_CONTENT_CHARS).default(''),
+  // Derived client-side (tag-stripped, lower-cased). Edge has no DOM, so the
+  // server cannot compute it without a regex HTML parser that would be wrong in
+  // exactly the cases that matter.
+  searchText: z.string().max(200_000).default(''),
   folderId: z.string().min(1).max(64).default('all'),
   tags: z.array(z.string().min(1).max(64)).max(100).default([]),
   pinned: z.boolean().default(false),
@@ -148,6 +152,7 @@ export function createSyncHandler(deps: SyncHandlerDeps = {}) {
           id: note.id,
           title: note.title,
           content: note.content,
+          searchText: note.searchText,
           folderId: note.folderId,
           tags: note.tags,
           pinned: note.pinned,

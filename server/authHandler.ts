@@ -17,6 +17,8 @@ import {
 } from './session';
 import { errorResponse, jsonResponse, readJsonBody } from './http';
 import { clientIp, RateLimiter } from './rateLimit';
+import { getDatabase } from './db/client';
+import { tryRecordAuthEvent } from './accountHandler';
 
 /**
  * Authentication endpoints.
@@ -147,6 +149,15 @@ export function createGoogleLoginHandler(deps: GoogleLoginDeps = {}) {
       throw err;
     }
 
+    // Audit the sign-in. Best-effort: a deployment without DATABASE_URL has no
+    // audit table, and that must not block anyone from signing in.
+    await tryRecordAuthEvent({
+      db: getDatabase,
+      userId: profile.sub,
+      event: 'sign_in',
+      request,
+    });
+
     return jsonResponse(
       200,
       {
@@ -192,6 +203,24 @@ export async function handleLogout(request: Request): Promise<Response> {
   // Clearing a cookie the client does not have is harmless, so this needs no
   // session lookup and cannot be used to probe who is signed in.
   const hadSession = Boolean(parseCookies(request.headers.get('cookie'))[SESSION_COOKIE]);
+
+  // Audit only when the cookie actually verifies. The response still reveals
+  // nothing about who it was, so the no-probe property above is preserved.
+  if (hadSession) {
+    try {
+      const user = await readSession(request);
+      if (user) {
+        await tryRecordAuthEvent({
+          db: getDatabase,
+          userId: user.sub,
+          event: 'sign_out',
+          request,
+        });
+      }
+    } catch {
+      // An expired or forged cookie simply clears without an audit entry.
+    }
+  }
 
   return jsonResponse(
     200,

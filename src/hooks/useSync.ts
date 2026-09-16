@@ -4,6 +4,7 @@ import { safeLocalStorageGet, safeLocalStorageSet } from '../utils/helpers';
 import {
   collectChangedFolders,
   collectChangedNotes,
+  prepareNotesForSync,
   mergeFolders,
   mergeNotes,
 } from '../services/sync/merge';
@@ -66,7 +67,7 @@ export function useSync({ isAuthenticated, notes, folders, onApplyRemote }: UseS
 
     try {
       const result = await pushAndPull({
-        notes: collectChangedNotes(notesRef.current, cursorRef.current),
+        notes: prepareNotesForSync(collectChangedNotes(notesRef.current, cursorRef.current)),
         folders: collectChangedFolders(foldersRef.current, cursorRef.current),
         since: cursorRef.current,
       });

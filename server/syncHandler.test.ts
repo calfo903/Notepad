@@ -1,12 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { PGlite } from '@electric-sql/pglite';
-import { drizzle, type PgliteDatabase } from 'drizzle-orm/pglite';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import * as schema from './db/schema';
 import { createListHandler, createSyncHandler } from './syncHandler';
-import type { Database } from './db/client';
+import { createTestDatabase, type TestDatabase } from './db/testDatabase';
 import { createSessionToken } from './session';
 
 /**
@@ -14,25 +9,14 @@ import { createSessionToken } from './session';
  * repository, so the HTTP layer and the SQL are verified together.
  */
 
-const MIGRATION_SQL = readFileSync(
-  fileURLToPath(new URL('./db/migrations/0000_init.sql', import.meta.url)),
-  'utf8'
-);
-
 const SECRET = 'test-secret-value-that-is-long-enough-for-hs256';
 const USER_SUB = 'google-sub-http-test';
 
-let client: PGlite;
-let db: PgliteDatabase<typeof schema>;
-let cookie: string;
-
-/** PGlite and the Neon driver are different Drizzle dialects over the same schema. */
-function asDatabase(value: PgliteDatabase<typeof schema>): Database {
-  return value as unknown as Database;
-}
+let harness!: TestDatabase;
+let cookie!: string;
 
 function handlers() {
-  const resolve = () => asDatabase(db);
+  const resolve = () => harness.db;
   return { sync: createSyncHandler({ db: resolve }), list: createListHandler({ db: resolve }) };
 }
 
@@ -50,6 +34,7 @@ function notePayload(overrides: Record<string, unknown> = {}) {
     trashed: false,
     wordCount: 1,
     charCount: 13,
+    searchText: 'untitled body',
     createdAt: BASE,
     updatedAt: BASE,
     ...overrides,
@@ -78,9 +63,7 @@ function listRequest(opts: { auth?: boolean; method?: string } = {}): Request {
 
 beforeAll(async () => {
   process.env.SESSION_SECRET = SECRET;
-  client = new PGlite();
-  await client.exec(MIGRATION_SQL);
-  db = drizzle(client, { schema });
+  harness = await createTestDatabase();
 
   const token = await createSessionToken(
     { sub: USER_SUB, email: 'sync@example.com', emailVerified: true, name: 'Sync', picture: null },
@@ -90,11 +73,11 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await client.exec('TRUNCATE "notes", "folders"');
+  await harness.truncate();
 });
 
 afterAll(async () => {
-  await client.close();
+  await harness.close();
   delete process.env.SESSION_SECRET;
 });
 
