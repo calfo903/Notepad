@@ -1,10 +1,19 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useMemo, useRef } from 'react';
 import { AIMessage, AIMemory, AIQuickAction, AIGenerateType, AI_MEMORY_KEY } from '../types';
 import { generateId, safeLocalStorageGet, safeLocalStorageSet } from '../utils/helpers';
-import type { PuterAIMessage, PuterAIChatOptions, PuterAIResponse, PuterAIStreamChunk } from '../puter.d';
-
+import { getProvider } from '../services/ai/registry';
+import {
+  AIProviderError,
+  ChatMessage,
+  ProviderAbortedError,
+  ProviderRateLimitError,
+} from '../services/ai/types';
 
 const MAX_HISTORY = 20;
+/** Turns of prior conversation replayed to the model. */
+const MAX_CONTEXT_TURNS = 6;
+/** Bound on note context forwarded per request. */
+const MAX_NOTE_CONTEXT = 2_000;
 
 function loadMemory(): AIMemory {
   return safeLocalStorageGet<AIMemory>(AI_MEMORY_KEY, {
@@ -17,8 +26,26 @@ function loadMemory(): AIMemory {
   });
 }
 
-function saveMemory(memory: AIMemory) {
+function saveMemory(memory: AIMemory): void {
   safeLocalStorageSet(AI_MEMORY_KEY, memory);
+}
+
+/**
+ * Map a provider failure to a message worth showing. Aborts are user-initiated
+ * and are deliberately not surfaced as errors.
+ */
+export function describeAIError(error: unknown): string {
+  if (error instanceof ProviderAbortedError) return '';
+
+  if (error instanceof ProviderRateLimitError) {
+    return error.retryAfterSeconds > 0
+      ? `You have hit the AI rate limit. Try again in ${error.retryAfterSeconds}s.`
+      : error.message;
+  }
+
+  if (error instanceof AIProviderError) return error.message;
+  if (error instanceof Error) return error.message;
+  return 'AI request failed';
 }
 
 export function useAI() {
@@ -26,7 +53,10 @@ export function useAI() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamingResponse, setStreamingResponse] = useState<string>('');
-  const abortRef = useRef(false);
+
+  const provider = useMemo(() => getProvider(), []);
+  /** Real cancellation: aborts the HTTP request, not just the render loop. */
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const updateMemory = useCallback((updates: Partial<AIMemory>) => {
     setMemory((prev) => {
@@ -47,12 +77,17 @@ export function useAI() {
 
   const updateNoteContext = useCallback((noteTitle: string, tags: string[]) => {
     setMemory((prev) => {
-      const recentNotes = [noteTitle, ...prev.noteContext.recentNotes.filter((n) => n !== noteTitle)].slice(0, 10);
-      const allTags = [...prev.noteContext.commonTags, ...tags];
-      const tagCounts = allTags.reduce((acc, tag) => {
-        acc[tag] = (acc[tag] || 0) + 1;
-        return acc;
-      }, {} as Record<string, number>);
+      const recentNotes = [noteTitle, ...prev.noteContext.recentNotes.filter((n) => n !== noteTitle)].slice(
+        0,
+        10
+      );
+      const tagCounts = [...prev.noteContext.commonTags, ...tags].reduce(
+        (acc, tag) => {
+          acc[tag] = (acc[tag] || 0) + 1;
+          return acc;
+        },
+        {} as Record<string, number>
+      );
       const commonTags = Object.entries(tagCounts)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 10)
@@ -81,8 +116,12 @@ export function useAI() {
     []
   );
 
+  /**
+   * Application-level instructions only. Note body is deliberately excluded —
+   * it travels as untrusted context so the backend can wrap and bound it.
+   */
   const buildSystemPrompt = useCallback(
-    (noteContent?: string, noteTitle?: string) => {
+    (noteTitle?: string) => {
       const parts = [
         'You are NoteFlow AI, an intelligent writing assistant built into an advanced notepad application.',
         'You help users write, edit, improve, summarize, translate, and brainstorm content.',
@@ -102,11 +141,6 @@ export function useAI() {
       if (noteTitle) {
         parts.push(`Current note title: "${noteTitle}"`);
       }
-      if (noteContent) {
-        parts.push(
-          `Current note content (for context):\n---\n${noteContent.slice(0, 2000)}${noteContent.length > 2000 ? '...' : ''}\n---`
-        );
-      }
 
       return parts.join('\n');
     },
@@ -122,17 +156,21 @@ export function useAI() {
         stream?: boolean;
       }
     ): Promise<string> => {
-      if (!window.puter) {
-        setError('Puter.js not loaded. Please refresh the page.');
+      if (!provider.isAvailable) {
+        setError(`The ${provider.label} provider is unavailable.`);
         return '';
       }
+
+      // Cancel any in-flight request before starting another; two concurrent
+      // streams writing to the same buffer would interleave into garbage.
+      abortControllerRef.current?.abort();
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
 
       setIsLoading(true);
       setError(null);
       setStreamingResponse('');
-      abortRef.current = false;
 
-      // Add user message to history
       const userMsg: AIMessage = {
         id: generateId(),
         role: 'user',
@@ -141,85 +179,58 @@ export function useAI() {
       };
       addToHistory(userMsg);
 
+      const messages: ChatMessage[] = [
+        { role: 'system', content: buildSystemPrompt(options?.noteTitle) },
+        ...memory.conversationHistory
+          .filter((m): m is AIMessage & { role: 'user' | 'assistant' } => m.role !== 'system')
+          .slice(-MAX_CONTEXT_TURNS)
+          .map((m) => ({ role: m.role, content: m.content })),
+        { role: 'user', content: userMessage },
+      ];
+
+      const noteContext = options?.noteContent?.slice(0, MAX_NOTE_CONTEXT);
+
+      let fullResponse = '';
+
       try {
-        const systemPrompt = buildSystemPrompt(options?.noteContent, options?.noteTitle);
-
-        // Build messages with history context
-        const messages = [
-          { role: 'system' as const, content: systemPrompt },
-          ...memory.conversationHistory.slice(-6).map((m) => ({
-            role: m.role as 'user' | 'assistant',
-            content: m.content,
-          })),
-          { role: 'user' as const, content: userMessage },
-        ];
-
-        let fullResponse = '';
-
         if (options?.stream) {
-          const response: PuterAIResponse | AsyncIterable<PuterAIStreamChunk> = await window.puter.ai.chat(
-            messages as PuterAIMessage[],
-            { stream: true } as PuterAIChatOptions
-          );
-
-          // Handle streaming response - check if it's an async iterable
-          try {
-            if (response && typeof (response as AsyncIterable<PuterAIStreamChunk>)[Symbol.asyncIterator] === 'function') {
-              for await (const chunk of response as AsyncIterable<PuterAIStreamChunk>) {
-                if (abortRef.current) break;
-                const text = chunk?.text || '';
-                fullResponse += text;
-                setStreamingResponse(fullResponse);
-              }
-            } else {
-              // Fallback for non-streaming response
-              const nonStreamResponse = response as PuterAIResponse;
-              if (nonStreamResponse?.message?.content) {
-                const content = nonStreamResponse.message.content;
-                fullResponse = typeof content === 'string' 
-                  ? content 
-                  : content.map((c: { text?: string }) => c.text || '').join('');
-              } else {
-                fullResponse = nonStreamResponse?.toString() || '';
-              }
-            }
-          } catch {
-            // Handle any streaming errors gracefully
-            fullResponse = 'Sorry, there was an error processing the response.';
+          for await (const delta of provider.stream({
+            messages,
+            noteContext,
+            signal: controller.signal,
+          })) {
+            fullResponse += delta;
+            setStreamingResponse(fullResponse);
           }
         } else {
-          const response: PuterAIResponse = await window.puter.ai.chat(messages as PuterAIMessage[]);
-          if (response?.message?.content) {
-            const content = response.message.content;
-            fullResponse = typeof content === 'string' 
-              ? content 
-              : content.map((c: { text?: string }) => c.text || '').join('');
-          } else {
-            fullResponse = response?.toString() || '';
-          }
+          fullResponse = await provider.complete({
+            messages,
+            noteContext,
+            signal: controller.signal,
+          });
         }
 
-        // Add assistant response to history
-        const assistantMsg: AIMessage = {
+        addToHistory({
           id: generateId(),
           role: 'assistant',
           content: fullResponse,
           timestamp: Date.now(),
-        };
-        addToHistory(assistantMsg);
+        });
 
-        abortRef.current = false;
-        setIsLoading(false);
-        setStreamingResponse('');
         return fullResponse;
       } catch (e) {
-        const errorMessage = e instanceof Error ? e.message : 'AI request failed';
-        setError(errorMessage);
-        setIsLoading(false);
+        // An abort is a normal outcome of stopGeneration, not a failure.
+        if (e instanceof ProviderAbortedError || controller.signal.aborted) return fullResponse;
+
+        setError(describeAIError(e));
         return '';
+      } finally {
+        if (abortControllerRef.current === controller) abortControllerRef.current = null;
+        setIsLoading(false);
+        setStreamingResponse('');
       }
     },
-    [addToHistory, buildSystemPrompt, memory.conversationHistory]
+    [addToHistory, buildSystemPrompt, memory.conversationHistory, provider]
   );
 
   const quickAction = useCallback(
@@ -262,7 +273,8 @@ export function useAI() {
   );
 
   const stopGeneration = useCallback(() => {
-    abortRef.current = true;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     setIsLoading(false);
     setStreamingResponse('');
   }, []);
@@ -276,6 +288,8 @@ export function useAI() {
     isLoading,
     error,
     streamingResponse,
+    providerId: provider.id,
+    providerLabel: provider.label,
     chat,
     quickAction,
     generateContent,

@@ -1,0 +1,95 @@
+import { z } from 'zod';
+
+/**
+ * Request contract for POST /api/chat.
+ *
+ * This is the trust boundary. The browser is hostile: every field is bounded so
+ * a client cannot inflate token spend, smuggle an unexpected model, or submit a
+ * payload the upstream provider would reject with a confusing 4xx.
+ */
+
+export const chatRoleSchema = z.enum(['system', 'user', 'assistant']);
+
+export const chatMessageSchema = z.object({
+  role: chatRoleSchema,
+  // 32k chars ≈ 8k tokens; note context is truncated to 2k upstream anyway.
+  content: z.string().min(1).max(32_000),
+});
+
+export const chatRequestSchema = z.object({
+  messages: z.array(chatMessageSchema).min(1).max(64),
+  model: z
+    .string()
+    // OpenRouter ids look like `openai/gpt-4o-mini` or `anthropic/claude-3.5-sonnet`.
+    .regex(/^[a-z0-9][a-z0-9._-]{0,127}\/[a-z0-9][a-z0-9._:-]{0,127}$/i)
+    .optional(),
+  stream: z.boolean().default(true),
+  /**
+   * Current note body, forwarded for model context. Bounded here so an
+   * oversized payload is rejected before it is ever concatenated into a prompt.
+   * It is always treated as untrusted data by the prompt guard.
+   */
+  noteContext: z.string().max(8_000).optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  maxTokens: z.number().int().min(1).max(8_192).optional(),
+});
+
+export type ChatRequestBody = z.infer<typeof chatRequestSchema>;
+export type ChatMessageInput = z.infer<typeof chatMessageSchema>;
+
+/**
+ * Models a client may request. Anything outside this list is rejected rather
+ * than forwarded, so a modified client cannot silently spend on a premium model.
+ * Override with a comma-separated `OPENROUTER_ALLOWED_MODELS`.
+ */
+const DEFAULT_ALLOWED_MODELS: readonly string[] = Object.freeze([
+  'openai/gpt-4o-mini',
+  'openai/gpt-4o',
+  'anthropic/claude-3.5-haiku',
+  'anthropic/claude-3.5-sonnet',
+  'google/gemini-flash-1.5',
+  'meta-llama/llama-3.3-70b-instruct',
+  'mistralai/mistral-small-3.1-24b-instruct',
+]);
+
+export const FALLBACK_MODEL = 'openai/gpt-4o-mini';
+
+function parseAllowlist(raw: string | undefined): readonly string[] {
+  if (!raw || raw.trim().length === 0) return DEFAULT_ALLOWED_MODELS;
+  return Object.freeze(
+    raw
+      .split(',')
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.length > 0)
+  );
+}
+
+export class ModelNotAllowedError extends Error {
+  override readonly name = 'ModelNotAllowedError';
+  readonly requested: string;
+
+  constructor(requested: string) {
+    super(`Model "${requested}" is not enabled for this deployment`);
+    this.requested = requested;
+  }
+}
+
+/**
+ * Resolve the model to use, rejecting anything outside the allowlist.
+ * `undefined` from the client falls back to the deployment default.
+ */
+export function resolveModel(
+  requested: string | undefined,
+  env: Record<string, string | undefined> = process.env
+): string {
+  const configuredDefault = env.OPENROUTER_MODEL?.trim();
+  const allowlist = parseAllowlist(env.OPENROUTER_ALLOWED_MODELS);
+
+  if (!requested) {
+    return configuredDefault && configuredDefault.length > 0 ? configuredDefault : FALLBACK_MODEL;
+  }
+
+  const normalised = requested.toLowerCase();
+  if (!allowlist.includes(normalised)) throw new ModelNotAllowedError(requested);
+  return normalised;
+}

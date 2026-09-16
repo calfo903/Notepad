@@ -1,6 +1,7 @@
 import { memo, useRef, useEffect, useCallback } from 'react';
 import { Note, ViewMode } from '../types';
 import { cn } from '../utils/helpers';
+import { sanitizeHtml } from '../utils/sanitize';
 
 interface NoteEditorProps {
   note: Note;
@@ -20,11 +21,14 @@ export const NoteEditor = memo(function NoteEditor({
   const titleRef = useRef<HTMLInputElement>(null);
   const lastContentRef = useRef<string>(note.content);
 
-  // Sync contentEditable with note content (only when note changes)
+  // Sync contentEditable with note content (only when note changes).
+  // Content may originate from localStorage or from inserted LLM output, so it
+  // is sanitized on the way into the DOM rather than trusted on the way out.
   useEffect(() => {
     if (editorRef.current && note.content !== lastContentRef.current) {
-      editorRef.current.innerHTML = note.content;
-      lastContentRef.current = note.content;
+      const clean = sanitizeHtml(note.content);
+      editorRef.current.innerHTML = clean;
+      lastContentRef.current = clean;
     }
   }, [note.id, note.content, editorRef]);
 
@@ -35,13 +39,59 @@ export const NoteEditor = memo(function NoteEditor({
     }
   }, [note.id, note.title, note.content]);
 
-  const handleInput = useCallback(() => {
-    if (editorRef.current) {
-      const content = editorRef.current.innerHTML;
-      lastContentRef.current = content;
-      onUpdate(note.id, { content });
-    }
+  /**
+   * Read the editor DOM, sanitize it, and commit to state.
+   *
+   * The sanitized string is stored in both state and `lastContentRef`, which
+   * keeps the sync effect's `note.content !== lastContentRef.current` guard
+   * satisfied. Without that invariant the effect would rewrite `innerHTML`
+   * after every keystroke and destroy the caret position.
+   */
+  const commitEditorContent = useCallback(() => {
+    if (!editorRef.current) return;
+
+    const clean = sanitizeHtml(editorRef.current.innerHTML);
+    lastContentRef.current = clean;
+    onUpdate(note.id, { content: clean });
   }, [note.id, editorRef, onUpdate]);
+
+  const handleInput = useCallback(() => {
+    commitEditorContent();
+  }, [commitEditorContent]);
+
+  /**
+   * Clipboard HTML is untrusted: browsers do not strip inline event handlers
+   * from pasted markup, so a pasted `<img src=x onerror=…>` would fire the
+   * moment it entered the connected editor DOM — before any state update could
+   * sanitize it. Intercept and sanitize at the insertion boundary instead.
+   */
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLDivElement>) => {
+      e.preventDefault();
+
+      const clipboard = e.clipboardData;
+      if (!clipboard) return;
+
+      const rawHtml = clipboard.getData('text/html');
+      const plainText = clipboard.getData('text/plain');
+
+      if (rawHtml) {
+        const clean = sanitizeHtml(rawHtml);
+        if (clean.length > 0) {
+          // insertHTML inserts at the live selection, preserving caret and undo.
+          document.execCommand('insertHTML', false, clean);
+          commitEditorContent();
+          return;
+        }
+      }
+
+      if (plainText.length > 0) {
+        document.execCommand('insertText', false, plainText);
+        commitEditorContent();
+      }
+    },
+    [commitEditorContent]
+  );
 
   const handleTitleChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -115,7 +165,7 @@ export const NoteEditor = memo(function NoteEditor({
             className="editor-content prose prose-lg dark:prose-invert max-w-none"
             dangerouslySetInnerHTML={{
               __html:
-                note.content ||
+                sanitizeHtml(note.content) ||
                 '<p class="text-text-secondary dark:text-text-secondary-dark italic">Nothing to preview</p>',
             }}
           />
@@ -125,6 +175,7 @@ export const NoteEditor = memo(function NoteEditor({
             contentEditable
             suppressContentEditableWarning
             onInput={handleInput}
+            onPaste={handlePaste}
             onKeyDown={handleEditorKeyDown}
             data-placeholder="Start writing your thoughts..."
             className={cn(

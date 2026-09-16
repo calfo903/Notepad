@@ -2,6 +2,8 @@
 // Utility Functions
 // ============================================================================
 
+import { plainTextToHtml } from './sanitize';
+
 /**
  * Generate a unique ID
  */
@@ -41,17 +43,43 @@ export function throttle<T extends (...args: unknown[]) => unknown>(
 }
 
 /**
- * Strip HTML tags and return plain text
- * SSR-safe: falls back to regex when document is not available
+ * Tags whose *text* is not content. In a parsed document their source is a
+ * child text node, so `textContent` would leak `<script>` bodies into note
+ * previews, word counts and `.txt` exports.
+ */
+const NON_CONTENT_SELECTOR = 'script, style, template, noscript, iframe, object, embed, svg, math';
+
+function removeNonContentNodes(root: ParentNode): void {
+  root.querySelectorAll(NON_CONTENT_SELECTOR).forEach((el) => el.remove());
+}
+
+/**
+ * Strip HTML tags and return plain text.
+ *
+ * Uses DOMParser rather than `innerHTML` on a detached element: the parsed
+ * document is inert, so `<script>` never runs and `<img src=… onerror=…>` never
+ * fires, even when the markup came from an LLM or from localStorage.
+ * SSR-safe: falls back to regex when no DOM is available.
  */
 export function stripHtml(html: string): string {
   if (!html) return '';
-  if (typeof document === 'undefined') {
+  if (typeof window === 'undefined') {
     return html.replace(/<[^>]*>/g, '');
   }
-  const tmp = document.createElement('div');
-  tmp.innerHTML = html;
-  return tmp.textContent || tmp.innerText || '';
+
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    removeNonContentNodes(doc);
+    return doc.body?.textContent ?? '';
+  } catch (e) {
+    // DOMParser unavailable (legacy environment). Detached parse as fallback —
+    // still no script execution because the node never connects to a document.
+    console.warn('DOMParser unavailable, falling back to detached parse:', e);
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    removeNonContentNodes(tmp);
+    return tmp.textContent || '';
+  }
 }
 
 /**
@@ -124,13 +152,12 @@ export function truncateContent(html: string, maxLength: number = 120): string {
 }
 
 /**
- * Convert plain text to HTML paragraphs
+ * Convert plain text to HTML paragraphs.
+ * The text is escaped, so HTML in the input renders literally instead of
+ * executing. Delegates to the sanitization module to keep escaping in one place.
  */
 export function textToHtml(text: string): string {
-  return text
-    .split('\n\n')
-    .map((p) => `<p>${p.replace(/\n/g, '<br>')}</p>`)
-    .join('');
+  return plainTextToHtml(text);
 }
 
 /**

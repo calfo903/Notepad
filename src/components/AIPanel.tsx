@@ -1,6 +1,7 @@
 import { memo, useState, useRef, useEffect, useCallback } from 'react';
 import { AIMessage, AIMemory, AIQuickAction, AIGenerateType } from '../types';
 import { cn } from '../utils/helpers';
+import { renderInlineMarkdown, sanitizeHtml } from '../utils/sanitize';
 import { Icons } from './icons';
 
 interface AIPanelProps {
@@ -157,13 +158,13 @@ export const AIPanel = memo(function AIPanel({
     }
   }, [lastResponse, onInsertContent]);
 
-  const formatMessage = useCallback((content: string) => {
-    return content
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/`(.*?)`/g, '<code class="bg-black/10 dark:bg-white/10 px-1 rounded text-sm">$1</code>')
-      .replace(/\n/g, '<br/>');
-  }, []);
+  // LLM output is untrusted input. Escape-then-format renders Markdown syntax
+  // while leaving any markup in the response inert; sanitizeHtml is applied on
+  // top as defence in depth so no tag outside the policy can reach the DOM.
+  const formatMessage = useCallback(
+    (content: string) => sanitizeHtml(renderInlineMarkdown(content)),
+    []
+  );
 
   if (!isOpen) return null;
 

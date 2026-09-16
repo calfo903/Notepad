@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import {
   Note,
+  Folder,
   DEFAULT_FOLDERS,
   STORAGE_KEY,
   Theme,
@@ -21,6 +22,7 @@ import {
   safeLocalStorageSet,
   sanitizeFilename,
 } from '../utils/helpers';
+import { escapeHtml, sanitizeHtml } from '../utils/sanitize';
 
 // ============================================================================
 // Initial State
@@ -429,18 +431,28 @@ export function useNotesStore() {
 
       const safeTitle = sanitizeFilename(note.title || 'note');
       switch (format) {
-        case 'html':
+        case 'html': {
+          // Exported files are opened directly from disk, i.e. outside this
+          // app's origin protections. Title is escaped, body is sanitized, and
+          // a CSP is emitted so any payload that slipped past both still cannot
+          // execute script or load remote resources.
+          const safeTitleText = escapeHtml(note.title);
           content = `<!DOCTYPE html>
-<html>
-<head><title>${note.title}</title></head>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<title>${safeTitleText}</title>
+</head>
 <body>
-<h1>${note.title}</h1>
-${note.content}
+<h1>${safeTitleText}</h1>
+${sanitizeHtml(note.content)}
 </body>
 </html>`;
           filename = `${safeTitle}.html`;
           mimeType = 'text/html';
           break;
+        }
         case 'markdown':
           content = `# ${note.title}\n\n${htmlToMarkdown(note.content)}`;
           filename = `${safeTitle}.md`;
@@ -554,6 +566,26 @@ ${note.content}
     updateState({ showMobileMenu: false, showMobileNoteList: false });
   }, [updateState]);
 
+  /**
+   * Replace notes and folders with a server-reconciled set.
+   *
+   * Called only by the sync layer. The active note may have been deleted on
+   * another device, so the selection is re-anchored to a row that still exists.
+   */
+  const applyRemoteSync = useCallback(
+    (nextNotes: Note[], nextFolders: Folder[]) => {
+      updateState((prev) => ({
+        notes: nextNotes,
+        folders: nextFolders,
+        activeNoteId: nextNotes.some((note) => note.id === prev.activeNoteId)
+          ? prev.activeNoteId
+          : (nextNotes[0]?.id ?? null),
+        saveStatus: 'saved' as const,
+      }));
+    },
+    [updateState]
+  );
+
   return {
     state,
     // Computed
@@ -572,6 +604,7 @@ ${note.content}
     duplicateNote,
     exportNote,
     reorderNotes,
+    applyRemoteSync,
     // UI Actions
     setActiveNote,
     setActiveFolder,

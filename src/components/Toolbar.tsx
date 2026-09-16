@@ -1,6 +1,7 @@
 import { memo, useState, useCallback, useRef, useEffect } from 'react';
 import { ViewMode, ExportFormat } from '../types';
 import { cn } from '../utils/helpers';
+import { isSafeUrl } from '../utils/sanitize';
 import { Icons } from './icons';
 
 interface ToolbarProps {
@@ -102,7 +103,21 @@ export const Toolbar = memo(function Toolbar({
 
   const handleInsertLink = useCallback(() => {
     const url = prompt('Enter URL:');
-    if (url) onFormat('createLink', url);
+    if (!url) return;
+
+    const trimmed = url.trim();
+    if (trimmed.length === 0) return;
+
+    // execCommand writes the anchor straight into the live editor DOM, so the
+    // scheme is validated here rather than relying on the sanitizer downstream.
+    if (!isSafeUrl(trimmed)) {
+      window.alert(
+        'Unsafe link blocked. Only http, https, mailto and tel URLs are allowed.'
+      );
+      return;
+    }
+
+    onFormat('createLink', trimmed);
   }, [onFormat]);
 
   return (
