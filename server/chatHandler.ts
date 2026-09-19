@@ -7,6 +7,12 @@ import {
 } from './schema';
 import { estimateTokens, getTokenBudget } from './costGuard';
 import { parseUsage, UsageScanner, type TokenUsage } from './usage';
+import {
+  PROMPT_VERSION,
+  createTraceId,
+  hashPrincipal,
+  logAiInteraction,
+} from './aiLog';
 import { errorResponse } from './http';
 import { hardenMessages } from './promptGuard';
 import { clientIp, createLimiterFromEnv } from './rateLimit';
@@ -146,9 +152,82 @@ function upstreamStatusToCode(status: number): { code: string; status: number } 
   return { code: 'UPSTREAM_REJECTED', status: 502 };
 }
 
+/**
+ * Outcome metadata, threaded through the handler so every return path can be
+ * logged without each one having to remember to.
+ */
+interface RequestMeta {
+  principal?: string;
+  model?: string;
+  stream?: boolean;
+  inputChars?: number;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
+  errorCode?: string;
+}
+
+/**
+ * Public entry point: assigns a trace id, times the request, logs one structured
+ * line, and stamps the trace id onto the response so a user report can be tied
+ * to a log entry.
+ *
+ * Logging wraps rather than lives inside the handler so an unexpected throw
+ * still produces a record.
+ */
 export async function handleChat(request: Request): Promise<Response> {
+  const traceId = createTraceId();
+  const startedAt = Date.now();
+  const meta: RequestMeta = {};
+
+  let response: Response;
+  try {
+    response = await handleChatInternal(request, traceId, meta);
+  } catch (err) {
+    meta.errorCode = 'INTERNAL';
+    // The original message goes to the operator, not the client.
+    console.error('[api/chat] unhandled error:', err instanceof Error ? err.message : err);
+    response = errorResponse(500, 'INTERNAL', 'Unexpected error handling the request.');
+  }
+
+  logAiInteraction({
+    traceId,
+    principal: meta.principal ?? 'anon',
+    model: meta.model ?? 'unknown',
+    promptVersion: PROMPT_VERSION,
+    stream: meta.stream ?? false,
+    inputChars: meta.inputChars ?? 0,
+    inputTokens: meta.inputTokens ?? null,
+    outputTokens: meta.outputTokens ?? null,
+    totalTokens: meta.totalTokens ?? null,
+    latencyMs: Date.now() - startedAt,
+    status: response.status,
+    ...(meta.errorCode === undefined ? {} : { errorCode: meta.errorCode }),
+  });
+
+  response.headers.set('x-trace-id', traceId);
+  return response;
+}
+
+async function handleChatInternal(
+  request: Request,
+  traceId: string,
+  meta: RequestMeta
+): Promise<Response> {
+  /** errorResponse wrapper that records the code for the log line. */
+  const fail = (
+    status: number,
+    code: string,
+    message: string,
+    details?: unknown,
+    headers: Record<string, string> = {}
+  ): Response => {
+    meta.errorCode = code;
+    return errorResponse(status, code, message, details, headers);
+  };
+
   if (request.method !== 'POST') {
-    return errorResponse(405, 'METHOD_NOT_ALLOWED', 'Only POST is accepted.', undefined, {
+    return fail(405, 'METHOD_NOT_ALLOWED', 'Only POST is accepted.', undefined, {
       Allow: 'POST',
     });
   }
@@ -157,7 +236,7 @@ export async function handleChat(request: Request): Promise<Response> {
   if (!apiKey) {
     // Fail loudly. There is deliberately no embedded fallback key.
     console.error('[api/chat] OPENROUTER_API_KEY is not configured');
-    return errorResponse(
+    return fail(
       503,
       'PROVIDER_NOT_CONFIGURED',
       'The AI provider is not configured on this deployment. Set OPENROUTER_API_KEY.'
@@ -170,7 +249,7 @@ export async function handleChat(request: Request): Promise<Response> {
   try {
     user = await readSession(request);
   } catch (err) {
-    if (err instanceof AuthError) return errorResponse(err.status, err.code, err.message);
+    if (err instanceof AuthError) return fail(err.status, err.code, err.message);
     throw err;
   }
 
@@ -178,10 +257,13 @@ export async function handleChat(request: Request): Promise<Response> {
   // attacker trivially multiplies, so it must be opted into explicitly rather
   // than being the state a forgotten env var leaves you in.
   if (!user && process.env.REQUIRE_AUTH_FOR_AI !== 'false') {
-    return errorResponse(401, 'AUTH_REQUIRED', 'Sign in to use the AI assistant.', undefined, {
+    return fail(401, 'AUTH_REQUIRED', 'Sign in to use the AI assistant.', undefined, {
       'www-authenticate': 'Cookie',
     });
   }
+
+  // Hashed so the log can be correlated per user without holding identifiers.
+  meta.principal = user ? await hashPrincipal(user.sub) : 'anon';
 
   const bucketKey = user ? `user:${user.sub}` : `ip:${clientIp(request)}`;
   const decision = limiter.consume(bucketKey);
@@ -192,7 +274,7 @@ export async function handleChat(request: Request): Promise<Response> {
   };
 
   if (!decision.allowed) {
-    return errorResponse(
+    return fail(
       429,
       'RATE_LIMITED',
       `Too many AI requests. Try again in ${decision.retryAfterSeconds}s.`,
@@ -205,12 +287,12 @@ export async function handleChat(request: Request): Promise<Response> {
   try {
     raw = await request.json();
   } catch {
-    return errorResponse(400, 'INVALID_JSON', 'Request body is not valid JSON.', undefined, limitHeaders);
+    return fail(400, 'INVALID_JSON', 'Request body is not valid JSON.', undefined, limitHeaders);
   }
 
   const parsed = chatRequestSchema.safeParse(raw);
   if (!parsed.success) {
-    return errorResponse(
+    return fail(
       400,
       'VALIDATION_FAILED',
       'Request body failed schema validation.',
@@ -229,12 +311,16 @@ export async function handleChat(request: Request): Promise<Response> {
     model = resolveModel(body.model);
   } catch (err) {
     if (err instanceof ModelNotAllowedError) {
-      return errorResponse(403, 'MODEL_NOT_ALLOWED', err.message, undefined, limitHeaders);
+      return fail(403, 'MODEL_NOT_ALLOWED', err.message, undefined, limitHeaders);
     }
     throw err;
   }
 
   const messages = hardenMessages(body.messages, body.noteContext);
+
+  meta.model = model;
+  meta.stream = body.stream;
+  meta.inputChars = messages.reduce((sum, message) => sum + message.content.length, 0);
 
   // Output length is always set server-side. Omitting it defers to the provider
   // default, which is not a control we own.
@@ -254,13 +340,11 @@ export async function handleChat(request: Request): Promise<Response> {
   // Reserve against the daily token budget before spending. The estimate covers
   // input plus the worst-case output; `record` reconciles it afterwards.
   const budget = getTokenBudget();
-  const estimatedInput = estimateTokens(
-    messages.reduce((sum, message) => sum + message.content.length, 0)
-  );
+  const estimatedInput = estimateTokens(meta.inputChars);
   const budgetDecision = await budget.check(bucketKey, estimatedInput + maxTokens);
 
   if (!budgetDecision.allowed) {
-    return errorResponse(
+    return fail(
       429,
       'BUDGET_EXCEEDED',
       `Daily AI token budget exhausted. Resets in ${Math.ceil(budgetDecision.resetsInSeconds / 3600)}h.`,
@@ -279,6 +363,11 @@ export async function handleChat(request: Request): Promise<Response> {
   const recordUsage = (usage: TokenUsage): void => {
     if (usageRecorded) return;
     usageRecorded = true;
+
+    meta.inputTokens = usage.promptTokens;
+    meta.outputTokens = usage.completionTokens;
+    meta.totalTokens = usage.totalTokens;
+
     void budget.record(bucketKey, usage.totalTokens);
   };
 
@@ -294,6 +383,8 @@ export async function handleChat(request: Request): Promise<Response> {
         // OpenRouter attribution headers; site is optional but improves routing.
         'HTTP-Referer': process.env.APP_BASE_URL ?? 'https://noteflow.local',
         'X-Title': 'NoteFlow AI',
+        // Correlates our log line with the provider's own request record.
+        'X-Request-Id': traceId,
       },
       body: JSON.stringify(upstreamPayload),
       signal: linked.signal,
@@ -301,11 +392,11 @@ export async function handleChat(request: Request): Promise<Response> {
   } catch (err) {
     linked.dispose();
     if (linked.signal.aborted) {
-      return errorResponse(499, 'CLIENT_ABORTED', 'Request was cancelled.', undefined, limitHeaders);
+      return fail(499, 'CLIENT_ABORTED', 'Request was cancelled.', undefined, limitHeaders);
     }
     const message = err instanceof Error ? err.message : 'Upstream request failed';
     console.error('[api/chat] upstream fetch failed:', message);
-    return errorResponse(502, 'UPSTREAM_UNREACHABLE', 'Could not reach the AI provider.', undefined, limitHeaders);
+    return fail(502, 'UPSTREAM_UNREACHABLE', 'Could not reach the AI provider.', undefined, limitHeaders);
   }
 
   if (!upstream.ok) {
@@ -321,7 +412,7 @@ export async function handleChat(request: Request): Promise<Response> {
       // Non-JSON upstream error body; the status line is sufficient.
     }
 
-    return errorResponse(mapped.status, mapped.code, detail, undefined, limitHeaders);
+    return fail(mapped.status, mapped.code, detail, undefined, limitHeaders);
   }
 
   if (body.stream && upstream.body !== null) {
@@ -356,7 +447,7 @@ export async function handleChat(request: Request): Promise<Response> {
       });
     } catch {
       linked.dispose();
-      return errorResponse(502, 'UPSTREAM_MALFORMED', 'Provider returned an unreadable response.', undefined, limitHeaders);
+      return fail(502, 'UPSTREAM_MALFORMED', 'Provider returned an unreadable response.', undefined, limitHeaders);
     }
   }
 
@@ -371,6 +462,6 @@ export async function handleChat(request: Request): Promise<Response> {
     });
   } catch {
     linked.dispose();
-    return errorResponse(502, 'UPSTREAM_MALFORMED', 'Provider returned an unreadable response.', undefined, limitHeaders);
+    return fail(502, 'UPSTREAM_MALFORMED', 'Provider returned an unreadable response.', undefined, limitHeaders);
   }
 }
