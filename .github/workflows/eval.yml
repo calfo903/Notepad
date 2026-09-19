@@ -37,16 +37,28 @@ jobs:
   live-eval:
     name: Live model eval
     runs-on: ubuntu-latest
-    # Costs money per run and needs a secret. Skips silently on forks and on
-    # repos where the key is not configured, so it never blocks a PR red.
-    if: ${{ github.event_name == 'workflow_dispatch' || secrets.OPENROUTER_API_KEY != '' }}
+    # Manual only: this costs money per run. Note that `secrets` is NOT a valid
+    # context in a job-level `if` — the supported contexts there are github,
+    # needs, vars and inputs — so the key is checked inside the job instead.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check the API key is configured
+        env:
+          KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::OPENROUTER_API_KEY is not set. Add it as a repository secret to run the live eval."
+            exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+
       - name: Score live output
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
