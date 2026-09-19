@@ -41,3 +41,9 @@ if (isBrowser) {
     writable: true,
   });
 }
+
+// jsdom does not implement Element.scrollIntoView, which AIPanel calls to keep
+// the latest message visible. Without this every render of that component throws.
+if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}

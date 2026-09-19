@@ -109,6 +109,8 @@ export async function syncAll(
           archived: sql`excluded.archived`,
           trashed: sql`excluded.trashed`,
           wordCount: sql`excluded.word_count`,
+          // A user's opt-out must survive a sync from another device.
+          excludeFromAi: sql`excluded.exclude_from_ai`,
           charCount: sql`excluded.char_count`,
           createdAt: sql`excluded.created_at`,
           updatedAt: sql`excluded.updated_at`,

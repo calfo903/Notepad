@@ -27,6 +27,8 @@ const noteInputSchema = z.object({
   trashed: z.boolean().default(false),
   wordCount: z.number().int().min(0).max(10_000_000).default(0),
   charCount: z.number().int().min(0).max(10_000_000).default(0),
+  /** Per-note opt-out of AI context. Defaults false: absent means "no opinion". */
+  excludeFromAi: z.boolean().default(false),
   // Client timestamps are epoch milliseconds.
   createdAt: z.number().int().min(0),
   updatedAt: z.number().int().min(0),
@@ -71,6 +73,7 @@ function toClientNote(row: NoteRow): Record<string, unknown> {
     trashed: row.trashed,
     wordCount: row.wordCount,
     charCount: row.charCount,
+    ...(row.excludeFromAi ? { excludeFromAi: true } : {}),
     createdAt: row.createdAt.getTime(),
     updatedAt: row.updatedAt.getTime(),
     ...(row.deletedAt === null ? {} : { deletedAt: row.deletedAt.getTime() }),
@@ -160,6 +163,7 @@ export function createSyncHandler(deps: SyncHandlerDeps = {}) {
           trashed: note.trashed,
           wordCount: note.wordCount,
           charCount: note.charCount,
+          excludeFromAi: note.excludeFromAi,
           createdAt: new Date(note.createdAt),
           updatedAt: new Date(note.updatedAt),
           deletedAt: note.deletedAt === null || note.deletedAt === undefined ? null : new Date(note.deletedAt),

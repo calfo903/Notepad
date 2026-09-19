@@ -15,6 +15,12 @@ export interface Note {
   updatedAt: number;
   wordCount: number;
   charCount: number;
+  /**
+   * When set, this note's content is never sent to the AI provider. The user can
+   * still chat — they just get no note context, which is the honest trade for
+   * keeping a sensitive note out of a third party's hands.
+   */
+  excludeFromAi?: boolean;
 }
 
 export interface Folder {

@@ -48,6 +48,8 @@ export const notes = pgTable(
     archived: boolean('archived').notNull().default(false),
     trashed: boolean('trashed').notNull().default(false),
     wordCount: integer('word_count').notNull().default(0),
+    /** Never send this note's content to a model. Enforced client-side. */
+    excludeFromAi: boolean('exclude_from_ai').notNull().default(false),
     charCount: integer('char_count').notNull().default(0),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull(),

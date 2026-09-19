@@ -33,6 +33,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Production dependencies only: a vulnerable dev tool is a real problem but
+      # not a shipped one, and failing the build over it trains people to ignore
+      # the step. High and above; Dependabot handles the rest.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Typecheck
         run: npx tsc --noEmit
 

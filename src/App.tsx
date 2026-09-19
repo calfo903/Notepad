@@ -466,6 +466,12 @@ function App() {
         streamingResponse={ai.streamingResponse}
         noteContent={activeNote ? stripHtml(activeNote.content) : undefined}
         noteTitle={activeNote?.title}
+        noteExcludedFromAi={activeNote?.excludeFromAi === true}
+        onToggleExcludeFromAi={
+          activeNote
+            ? (value) => updateNote(activeNote.id, { excludeFromAi: value })
+            : undefined
+        }
         onClose={() => setShowAIPanel(false)}
         onChat={ai.chat}
         onQuickAction={ai.quickAction}

@@ -1,12 +1,31 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for more information:
-# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
-# https://containers.dev/guide/dependabot
-
 version: 2
 updates:
- - package-ecosystem: "devcontainers"
-   directory: "/"
-   schedule:
-     interval: weekly
+  # The npm ecosystem was missing entirely, so runtime and build dependencies
+  # received no security updates — DOMPurify, jose and zod are all
+  # security-relevant and were being left wherever the lockfile happened to be.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Minor and patch updates arrive as one PR; majors stay individual so a
+      # breaking change is never bundled into a batch that gets rubber-stamped.
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Vite majors have historically required config changes; review manually.
+      - dependency-name: "vite"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: "devcontainers"
+    directory: "/"
+    schedule:
+      interval: weekly

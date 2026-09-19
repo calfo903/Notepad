@@ -29,6 +29,9 @@ const noteSchema = z.object({
   updatedAt: z.number().default(() => Date.now()),
   wordCount: z.number().int().min(0).default(0),
   charCount: z.number().int().min(0).default(0),
+  // Optional and absent by default: the safe state is "not excluded", and an
+  // older persisted note simply has no opinion.
+  excludeFromAi: z.boolean().optional(),
 });
 
 const folderSchema = z.object({

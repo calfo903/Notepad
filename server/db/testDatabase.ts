@@ -33,7 +33,11 @@ export interface TestDatabase {
 }
 
 /** Migrations in dependency order. */
-const MIGRATIONS = ['0000_init.sql', '0001_search_and_audit.sql'] as const;
+const MIGRATIONS = [
+  '0000_init.sql',
+  '0001_search_and_audit.sql',
+  '0002_exclude_from_ai.sql',
+] as const;
 
 export async function createTestDatabase(): Promise<TestDatabase> {
   // Contrib extensions must be registered at construction time. Issuing only
