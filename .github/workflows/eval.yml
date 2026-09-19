@@ -1,0 +1,53 @@
+name: Prompt eval
+
+on:
+  pull_request:
+    paths:
+      # Prompt regressions are what this workflow exists to catch. Running it on
+      # every push would spend CI minutes on changes that cannot affect a prompt.
+      - 'server/promptGuard.ts'
+      - 'server/chatHandler.ts'
+      - 'server/schema.ts'
+      - 'server/eval/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard-eval:
+    name: Deterministic guard eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # No API key, no cost, cannot flake. This is the gate.
+      - name: Run guard eval
+        run: npx tsx server/eval/run.ts
+
+  live-eval:
+    name: Live model eval
+    runs-on: ubuntu-latest
+    # Costs money per run and needs a secret. Skips silently on forks and on
+    # repos where the key is not configured, so it never blocks a PR red.
+    if: ${{ github.event_name == 'workflow_dispatch' || secrets.OPENROUTER_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Score live output
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: npx tsx server/eval/liveEval.ts
