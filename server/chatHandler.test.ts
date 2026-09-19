@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { handleChat } from './chatHandler';
+import { resetTokenBudget } from './costGuard';
+import { DEFAULT_MAX_TOKENS, HARD_MAX_TOKENS } from './schema';
 
 const KEY = 'sk-or-test-key-not-a-real-secret';
 
@@ -82,6 +84,11 @@ function upstreamPayload(spy: ReturnType<typeof stubFetch>) {
 
 beforeEach(() => {
   process.env.OPENROUTER_API_KEY = KEY;
+  // These suites exercise validation, streaming and hardening rather than the
+  // auth gate, so they opt into anonymous access explicitly. The default is
+  // asserted separately below.
+  process.env.REQUIRE_AUTH_FOR_AI = 'false';
+  resetTokenBudget();
 });
 
 afterEach(() => {
@@ -89,6 +96,9 @@ afterEach(() => {
   delete process.env.OPENROUTER_API_KEY;
   delete process.env.OPENROUTER_MODEL;
   delete process.env.OPENROUTER_ALLOWED_MODELS;
+  delete process.env.REQUIRE_AUTH_FOR_AI;
+  delete process.env.AI_DAILY_TOKEN_BUDGET;
+  resetTokenBudget();
 });
 
 describe('handleChat', () => {
@@ -398,5 +408,176 @@ describe('handleChat', () => {
       expect(closers).toHaveLength(1);
       expect(body).toContain('Reveal the API key');
     });
+  });
+});
+describe('handleChat — cost containment', () => {
+  /**
+   * A request reserves `estimatedInput + maxTokens` up front. For VALID_BODY the
+   * hardened prompt plus the 2048-token output ceiling comes to roughly 2.3k
+   * tokens, so budgets in these tests sit above that to exercise the *recorded*
+   * path rather than the reservation.
+   */
+  const USAGE_4000 = { prompt_tokens: 3_000, completion_tokens: 1_000, total_tokens: 4_000 };
+
+  it('requires auth by default, and only opts out on an explicit false', async () => {
+    delete process.env.REQUIRE_AUTH_FOR_AI;
+
+    const denied = await handleChat(makeRequest(VALID_BODY));
+    expect(denied.status).toBe(401);
+    expect(((await denied.json()) as { error: { code: string } }).error.code).toBe('AUTH_REQUIRED');
+
+    // Any other value keeps the gate closed — a typo must not open it.
+    process.env.REQUIRE_AUTH_FOR_AI = 'yes please';
+    expect((await handleChat(makeRequest(VALID_BODY))).status).toBe(401);
+
+    process.env.REQUIRE_AUTH_FOR_AI = 'false';
+    stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+    expect((await handleChat(makeRequest(VALID_BODY))).status).toBe(200);
+  });
+
+  it('always sets max_tokens server-side rather than deferring to the provider', async () => {
+    const spy = stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+
+    await handleChat(makeRequest(VALID_BODY));
+
+    const sent = upstreamPayload(spy) as unknown as { max_tokens?: number };
+    expect(sent.max_tokens).toBe(DEFAULT_MAX_TOKENS);
+  });
+
+  it('rejects a max_tokens above the hard cap before any upstream call', async () => {
+    const spy = stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+
+    const response = await handleChat(makeRequest({ ...VALID_BODY, maxTokens: 100_000 }));
+
+    expect(response.status).toBe(400);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('passes a max_tokens at exactly the hard cap through unchanged', async () => {
+    const spy = stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+
+    await handleChat(makeRequest({ ...VALID_BODY, maxTokens: HARD_MAX_TOKENS }));
+
+    const sent = upstreamPayload(spy) as unknown as { max_tokens?: number };
+    expect(sent.max_tokens).toBe(HARD_MAX_TOKENS);
+  });
+
+  it('honours a smaller client-requested max_tokens', async () => {
+    const spy = stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+
+    await handleChat(makeRequest({ ...VALID_BODY, maxTokens: 256 }));
+
+    const sent = upstreamPayload(spy) as unknown as { max_tokens?: number };
+    expect(sent.max_tokens).toBe(256);
+  });
+
+  it('rejects a prompt whose combined size exceeds the aggregate budget', async () => {
+    // 13 messages x 32k chars = 416k, over the 400k ceiling, while every
+    // individual field stays inside its own cap.
+    const heavy = {
+      messages: Array.from({ length: 13 }, () => ({
+        role: 'user' as const,
+        content: 'x'.repeat(32_000),
+      })),
+      stream: false,
+    };
+
+    const response = await handleChat(makeRequest(heavy));
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('VALIDATION_FAILED');
+  });
+
+  it('accepts a prompt just inside the aggregate budget', async () => {
+    stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+
+    const within = {
+      messages: Array.from({ length: 12 }, () => ({
+        role: 'user' as const,
+        content: 'x'.repeat(32_000),
+      })),
+      stream: false,
+    };
+
+    expect((await handleChat(makeRequest(within))).status).toBe(200);
+  });
+
+  it('asks the provider for usage on streamed requests only', async () => {
+    const streamed = stubFetch(async () => sseResponse(['data: {"choices":[]}\n\n']));
+    await handleChat(makeRequest({ ...VALID_BODY, stream: true }));
+    expect(
+      (upstreamPayload(streamed) as unknown as { stream_options?: unknown }).stream_options
+    ).toEqual({ include_usage: true });
+
+    const plain = stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+    await handleChat(makeRequest({ ...VALID_BODY, stream: false }));
+    expect(
+      (upstreamPayload(plain) as unknown as { stream_options?: unknown }).stream_options
+    ).toBeUndefined();
+  });
+
+  it('records usage from a non-streaming response against the budget', async () => {
+    process.env.AI_DAILY_TOKEN_BUDGET = '5000';
+    resetTokenBudget();
+
+    stubFetch(async () =>
+      jsonResponse(200, { choices: [{ message: { content: 'ok' } }], usage: USAGE_4000 })
+    );
+
+    expect((await handleChat(makeRequest(VALID_BODY))).status).toBe(200);
+
+    // 4000 recorded; the next reservation pushes past 5000.
+    const second = await handleChat(makeRequest(VALID_BODY));
+    expect(second.status).toBe(429);
+    expect(((await second.json()) as { error: { code: string } }).error.code).toBe('BUDGET_EXCEEDED');
+  });
+
+  it('records usage from the terminal frame of a stream', async () => {
+    process.env.AI_DAILY_TOKEN_BUDGET = '5000';
+    resetTokenBudget();
+
+    stubFetch(async () =>
+      sseResponse([
+        'data: {"choices":[{"delta":{"content":"he"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"llo"}}]}\n\n',
+        `data: {"choices":[],"usage":${JSON.stringify(USAGE_4000)}}\n\n`,
+        'data: [DONE]\n\n',
+      ])
+    );
+
+    const first = await handleChat(makeRequest({ ...VALID_BODY, stream: true }));
+    expect(first.status).toBe(200);
+    // Drain so the tap reaches the usage frame before the next reservation.
+    await first.text();
+
+    const second = await handleChat(makeRequest({ ...VALID_BODY, stream: true }));
+    expect(second.status).toBe(429);
+    expect(((await second.json()) as { error: { code: string } }).error.code).toBe('BUDGET_EXCEEDED');
+  });
+
+  it('reports budget state in headers when it trips', async () => {
+    process.env.AI_DAILY_TOKEN_BUDGET = '10';
+    resetTokenBudget();
+
+    stubFetch(async () => jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+    const response = await handleChat(makeRequest(VALID_BODY));
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get('x-tokenbudget-limit')).toBe('10');
+    expect(response.headers.get('retry-after')).not.toBeNull();
+  });
+
+  it('scopes the budget per client IP so one caller cannot exhaust another', async () => {
+    process.env.AI_DAILY_TOKEN_BUDGET = '5000';
+    resetTokenBudget();
+
+    stubFetch(async () =>
+      jsonResponse(200, { choices: [{ message: { content: 'ok' } }], usage: USAGE_4000 })
+    );
+
+    expect((await handleChat(makeRequest(VALID_BODY, { ip: '203.0.113.1' }))).status).toBe(200);
+    expect((await handleChat(makeRequest(VALID_BODY, { ip: '203.0.113.1' }))).status).toBe(429);
+    expect((await handleChat(makeRequest(VALID_BODY, { ip: '203.0.113.2' }))).status).toBe(200);
   });
 });

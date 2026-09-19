@@ -1,4 +1,12 @@
-import { chatRequestSchema, resolveModel, ModelNotAllowedError } from './schema';
+import {
+  chatRequestSchema,
+  resolveModel,
+  ModelNotAllowedError,
+  DEFAULT_MAX_TOKENS,
+  HARD_MAX_TOKENS,
+} from './schema';
+import { estimateTokens, getTokenBudget } from './costGuard';
+import { parseUsage, UsageScanner, type TokenUsage } from './usage';
 import { errorResponse } from './http';
 import { hardenMessages } from './promptGuard';
 import { clientIp, createLimiterFromEnv } from './rateLimit';
@@ -56,19 +64,37 @@ function combinedSignal(external: AbortSignal | null, timeoutMs: number): Combin
  * into a well-formed `event: error` the client can surface instead of a
  * silently truncated response.
  */
-function relaySSE(upstreamBody: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+/**
+ * Relay the upstream SSE body to the client while tapping it for usage.
+ *
+ * Bytes are forwarded verbatim — the tap is read-only, so a malformed usage
+ * frame can never corrupt the response the user sees.
+ */
+function relaySSE(
+  upstreamBody: ReadableStream<Uint8Array>,
+  onUsage?: (usage: TokenUsage) => void
+): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   const transform = new TransformStream<Uint8Array, Uint8Array>();
   const writer = transform.writable.getWriter();
   const reader = upstreamBody.getReader();
+  const scanner = new UsageScanner();
 
   void (async () => {
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+
+        const usage = scanner.push(value);
+        if (usage) onUsage?.(usage);
+
         await writer.write(value);
       }
+
+      const trailing = scanner.end();
+      if (trailing) onUsage?.(trailing);
+
       await writer.close();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Upstream stream terminated unexpectedly';
@@ -148,7 +174,10 @@ export async function handleChat(request: Request): Promise<Response> {
     throw err;
   }
 
-  if (!user && process.env.REQUIRE_AUTH_FOR_AI === 'true') {
+  // Secure by default. Anonymous AI use is keyed by IP, which a rotating
+  // attacker trivially multiplies, so it must be opted into explicitly rather
+  // than being the state a forgotten env var leaves you in.
+  if (!user && process.env.REQUIRE_AUTH_FOR_AI !== 'false') {
     return errorResponse(401, 'AUTH_REQUIRED', 'Sign in to use the AI assistant.', undefined, {
       'www-authenticate': 'Cookie',
     });
@@ -207,12 +236,50 @@ export async function handleChat(request: Request): Promise<Response> {
 
   const messages = hardenMessages(body.messages, body.noteContext);
 
+  // Output length is always set server-side. Omitting it defers to the provider
+  // default, which is not a control we own.
+  const maxTokens = Math.min(body.maxTokens ?? DEFAULT_MAX_TOKENS, HARD_MAX_TOKENS);
+
   const upstreamPayload = {
     model,
     messages,
     stream: body.stream,
     ...(body.temperature === undefined ? {} : { temperature: body.temperature }),
-    ...(body.maxTokens === undefined ? {} : { max_tokens: body.maxTokens }),
+    max_tokens: maxTokens,
+    // Without this the provider reports no usage on streamed calls, and cost
+    // accounting would be blind for the majority of traffic.
+    ...(body.stream ? { stream_options: { include_usage: true } } : {}),
+  };
+
+  // Reserve against the daily token budget before spending. The estimate covers
+  // input plus the worst-case output; `record` reconciles it afterwards.
+  const budget = getTokenBudget();
+  const estimatedInput = estimateTokens(
+    messages.reduce((sum, message) => sum + message.content.length, 0)
+  );
+  const budgetDecision = await budget.check(bucketKey, estimatedInput + maxTokens);
+
+  if (!budgetDecision.allowed) {
+    return errorResponse(
+      429,
+      'BUDGET_EXCEEDED',
+      `Daily AI token budget exhausted. Resets in ${Math.ceil(budgetDecision.resetsInSeconds / 3600)}h.`,
+      undefined,
+      {
+        ...limitHeaders,
+        'retry-after': String(budgetDecision.resetsInSeconds),
+        'x-tokenbudget-limit': String(budgetDecision.limitTokens),
+        'x-tokenbudget-used': String(budgetDecision.usedTokens),
+      }
+    );
+  }
+
+  /** Record real usage against the budget, once, whichever path reports it. */
+  let usageRecorded = false;
+  const recordUsage = (usage: TokenUsage): void => {
+    if (usageRecorded) return;
+    usageRecorded = true;
+    void budget.record(bucketKey, usage.totalTokens);
   };
 
   const linked = combinedSignal(request.signal, UPSTREAM_TIMEOUT_MS);
@@ -265,7 +332,7 @@ export async function handleChat(request: Request): Promise<Response> {
       // bounded by the client's own abort, not by our connect timeout.
       linked.dispose();
 
-      return new Response(relaySSE(upstream.body), {
+      return new Response(relaySSE(upstream.body, recordUsage), {
         status: 200,
         headers: {
           'content-type': 'text/event-stream; charset=utf-8',
@@ -281,6 +348,8 @@ export async function handleChat(request: Request): Promise<Response> {
     try {
       const payload: unknown = await upstream.json();
       linked.dispose();
+      const usage = parseUsage(payload);
+      if (usage) recordUsage(usage);
       return new Response(JSON.stringify({ content: extractCompletionText(payload), model }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', ...limitHeaders },
@@ -294,6 +363,8 @@ export async function handleChat(request: Request): Promise<Response> {
   try {
     const payload: unknown = await upstream.json();
     linked.dispose();
+    const usage = parseUsage(payload);
+    if (usage) recordUsage(usage);
     return new Response(JSON.stringify({ content: extractCompletionText(payload), model }), {
       status: 200,
       headers: { 'content-type': 'application/json; charset=utf-8', ...limitHeaders },

@@ -16,6 +16,25 @@ export const chatMessageSchema = z.object({
   content: z.string().min(1).max(32_000),
 });
 
+/**
+ * Aggregate ceiling on everything the client can put into a prompt.
+ *
+ * Per-field caps alone are not a cost control: 64 messages x 32k chars admits
+ * ~2M characters, and only the upstream model's context window would stop it.
+ * 400k chars is ~100k tokens, which fits every allowlisted model's window while
+ * bounding what a single request can bill.
+ */
+export const MAX_TOTAL_INPUT_CHARS = 400_000;
+
+/**
+ * Output length is capped server-side rather than left to the client.
+ *
+ * Omitting `max_tokens` hands the decision to the provider default, which an
+ * attacker cannot be relied upon to respect. The client may ask for less.
+ */
+export const DEFAULT_MAX_TOKENS = 2_048;
+export const HARD_MAX_TOKENS = 8_192;
+
 export const chatRequestSchema = z.object({
   messages: z.array(chatMessageSchema).min(1).max(64),
   model: z
@@ -31,10 +50,19 @@ export const chatRequestSchema = z.object({
    */
   noteContext: z.string().max(8_000).optional(),
   temperature: z.number().min(0).max(2).optional(),
-  maxTokens: z.number().int().min(1).max(8_192).optional(),
-});
+  maxTokens: z.number().int().min(1).max(HARD_MAX_TOKENS).optional(),
+}).refine(
+  (body) => {
+    const total = body.messages.reduce((sum, message) => sum + message.content.length, 0);
+    return total + (body.noteContext?.length ?? 0) <= MAX_TOTAL_INPUT_CHARS;
+  },
+  {
+    message: `Combined prompt exceeds ${MAX_TOTAL_INPUT_CHARS} characters.`,
+    path: ['messages'],
+  }
+);
 
-export type ChatRequestBody = z.infer<typeof chatRequestSchema>;
+export type ChatRequestBody = z.output<typeof chatRequestSchema>;
 export type ChatMessageInput = z.infer<typeof chatMessageSchema>;
 
 /**
