@@ -4,6 +4,7 @@ import {
   ModelNotAllowedError,
   DEFAULT_MAX_TOKENS,
   HARD_MAX_TOKENS,
+  MAX_TOTAL_INPUT_CHARS,
 } from './schema';
 import { estimateTokens, getTokenBudget } from './costGuard';
 import { parseUsage, UsageScanner, type TokenUsage } from './usage';
@@ -24,6 +25,8 @@ import { parseFallbackModels } from './schema';
 import { errorResponse } from './http';
 import { hardenMessages } from './promptGuard';
 import { clientIp, createLimiterFromEnv } from './rateLimit';
+import { createRateLimiter } from './distributedRateLimit';
+import { emitAlert } from './alerting';
 import { readSession, type SessionUser } from './session';
 import { AuthError } from './googleAuth';
 
@@ -42,7 +45,10 @@ const UPSTREAM_TIMEOUT_MS = 60_000;
 /** Base for jittered exponential backoff between upstream attempts. */
 const RETRY_BASE_MS = 250;
 
-const limiter = createLimiterFromEnv();
+// Resolves to a Redis-backed limiter when UPSTASH_REDIS_REST_URL/TOKEN are set,
+// and to the isolate-local bucket otherwise. Both sit behind one `consume`, so
+// the choice of backend lives in exactly one place.
+const limiter = createRateLimiter(createLimiterFromEnv());
 
 interface CombinedSignal {
   readonly signal: AbortSignal;
@@ -352,7 +358,7 @@ async function handleChatInternal(
   meta.principal = user ? await hashPrincipal(user.sub) : 'anon';
 
   const bucketKey = user ? `user:${user.sub}` : `ip:${clientIp(request)}`;
-  const decision = limiter.consume(bucketKey);
+  const decision = await limiter.consume(bucketKey);
   const limitHeaders: Record<string, string> = {
     'x-ratelimit-limit': String(decision.limit),
     'x-ratelimit-remaining': String(decision.remaining),
@@ -378,6 +384,19 @@ async function handleChatInternal(
 
   const parsed = chatRequestSchema.safeParse(raw);
   if (!parsed.success) {
+    // Worth waking someone for: a client that starts sending 400k prompts is
+    // either broken or probing, and it is invisible in a status-code dashboard.
+    const oversized = parsed.error.issues.some((issue) =>
+      issue.message.includes('Combined prompt exceeds')
+    );
+    if (oversized) {
+      emitAlert('oversized_request_rejected', {
+        principal: meta.principal,
+        traceId,
+        limit: MAX_TOTAL_INPUT_CHARS,
+      });
+    }
+
     return fail(
       400,
       'VALIDATION_FAILED',
@@ -397,6 +416,11 @@ async function handleChatInternal(
     model = resolveModel(body.model);
   } catch (err) {
     if (err instanceof ModelNotAllowedError) {
+      emitAlert('model_not_allowed', {
+        principal: meta.principal,
+        traceId,
+        requested: typeof body.model === 'string' ? body.model : undefined,
+      });
       return fail(403, 'MODEL_NOT_ALLOWED', err.message, undefined, limitHeaders);
     }
     throw err;
@@ -438,6 +462,13 @@ async function handleChatInternal(
   const budgetDecision = await budget.check(bucketKey, estimatedInput + maxTokens);
 
   if (!budgetDecision.allowed) {
+    emitAlert('token_budget_exceeded', {
+      principal: meta.principal,
+      traceId,
+      limitTokens: budgetDecision.limitTokens,
+      usedTokens: budgetDecision.usedTokens,
+      resetsInSeconds: budgetDecision.resetsInSeconds,
+    });
     return fail(
       429,
       'BUDGET_EXCEEDED',
@@ -471,6 +502,11 @@ async function handleChatInternal(
 
   if (attempt.kind === 'open') {
     linked.dispose();
+    emitAlert('upstream_circuit_open', {
+      traceId,
+      model,
+      retryAfterSeconds: Math.ceil(attempt.retryAfterMs / 1_000),
+    });
     return fail(
       503,
       'PROVIDER_CIRCUIT_OPEN',

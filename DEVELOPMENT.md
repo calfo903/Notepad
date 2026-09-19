@@ -30,6 +30,8 @@ missing, recreate it with at least:
 | `AI_DAILY_TOKEN_BUDGET` | `server/costGuard.ts` | Per-principal token budget per UTC day. Default 500000. Exceeding it returns `429 BUDGET_EXCEEDED`. |
 | `LOG_SALT` | `server/aiLog.ts`, `server/db/accountRepo.ts` | Salts the principal hash in request logs **and** the audit pseudonym written on account deletion. Without it both are reproducible from the source. |
 | `OPENROUTER_FALLBACK_MODELS` | `server/chatHandler.ts` | Comma-separated models tried after the primary, filtered against the allowlist. |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | `server/distributedRateLimit.ts` | Both required to make rate limiting global instead of per-isolate. |
+| `RATE_LIMIT_FAIL_OPEN` | `server/distributedRateLimit.ts` | Default `true`: degrade to the local bucket if Redis is down. `false` denies instead. |
 
 Generate a session secret with:
 
@@ -190,6 +192,18 @@ enabling `VITE_AI_PROVIDER=puter`: that path sends note content straight from th
 browser to Puter and bypasses the prompt guard, the token budget and the request
 log entirely.
 
+## Alerting
+
+`server/alerting.ts` emits one structured line per condition —
+`{"level":"error","event":"alert","alert":"<name>",...}` — for circuit open,
+budget exhausted, oversized request, model not allowed, and rate-limit-store
+degradation and recovery. There is no metrics backend in this repository by
+design: point a log-based alert at `"event":"alert"` and it works with whatever
+the host provides.
+
+Each alert name has a 60-second cooldown. An alert that fires on every request
+during an outage gets muted, and a muted alert is silence with extra steps.
+
 ## Governance documents
 
 | Document | What it answers |
@@ -216,8 +230,10 @@ the document look finished when it is not.
   terms only.
 - The live eval tier has never been run against a real provider from this
   environment, so model compliance with the guard is unverified.
-- The rate limiters are isolate-local, so each Edge isolate has its own bucket.
-  A shared store (Upstash/Redis) is the seam that needs filling.
+- The rate limiter is isolate-local **unless** `UPSTASH_REDIS_REST_URL` and
+  `UPSTASH_REDIS_REST_TOKEN` are set, in which case the bucket is global. Neither
+  is configured in this environment, so the multi-isolate multiplier still
+  applies to any deployment that has not opted in.
 - The editor is still `contentEditable`-based; migrating to ProseMirror or
   Lexical needs interactive visual verification.
 - `prettier --check` fails on files that predate this branch.

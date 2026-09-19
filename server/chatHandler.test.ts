@@ -3,7 +3,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { handleChat } from './chatHandler';
 import { resetTokenBudget } from './costGuard';
 import { resetUpstreamBreaker } from './circuitBreaker';
-import { DEFAULT_MAX_TOKENS, HARD_MAX_TOKENS } from './schema';
+import { DEFAULT_MAX_TOKENS, HARD_MAX_TOKENS, MAX_TOTAL_INPUT_CHARS } from './schema';
+import { configureAlerting, resetAlerting, type AlertRecord } from './alerting';
 
 const KEY = 'sk-or-test-key-not-a-real-secret';
 
@@ -93,9 +94,17 @@ beforeEach(() => {
   // The breaker is a process-wide singleton; a 5xx in one test must not make the
   // next test see an open circuit.
   resetUpstreamBreaker();
+  // Same for alert cooldowns: without this a suppression set by one test hides an
+  // alert the next test expects.
+  resetAlerting();
+  configureAlerting({ sink: (record) => alerts.push(record) });
 });
 
+let alerts: AlertRecord[] = [];
+
 afterEach(() => {
+  alerts = [];
+  resetAlerting();
   vi.unstubAllGlobals();
   delete process.env.OPENROUTER_API_KEY;
   delete process.env.OPENROUTER_MODEL;
@@ -585,5 +594,93 @@ describe('handleChat — cost containment', () => {
     expect((await handleChat(makeRequest(VALID_BODY, { ip: '203.0.113.1' }))).status).toBe(200);
     expect((await handleChat(makeRequest(VALID_BODY, { ip: '203.0.113.1' }))).status).toBe(429);
     expect((await handleChat(makeRequest(VALID_BODY, { ip: '203.0.113.2' }))).status).toBe(200);
+  });
+});
+
+describe('alerting on request paths', () => {
+  // Defined here: the same-named constant in the budget suite is scoped to that
+  // describe, and referencing it from outside is a ReferenceError at runtime that
+  // surfaces as a 502 rather than a clear failure.
+  const USAGE_4000 = { prompt_tokens: 3_000, completion_tokens: 1_000, total_tokens: 4_000 };
+
+  // Each test needs its own rate-limit bucket. The limiter is a module-level
+  // singleton, so sharing the default `ip:unknown` key with the rest of this file
+  // exhausts it and later tests get 429 for an unrelated reason.
+  const ip = (octet: number) => ({ ip: `203.0.113.${octet}` });
+
+  it('alerts when a principal exhausts the daily token budget', async () => {
+    process.env.AI_DAILY_TOKEN_BUDGET = '5000';
+    resetTokenBudget();
+
+    try {
+      stubFetch(async () =>
+        jsonResponse(200, { choices: [{ message: { content: 'ok' } }], usage: USAGE_4000 })
+      );
+
+      expect((await handleChat(makeRequest(VALID_BODY, ip(10)))).status).toBe(200);
+      expect(alerts.map((a) => a.alert)).not.toContain('token_budget_exceeded');
+
+      const second = await handleChat(makeRequest(VALID_BODY, ip(10)));
+      expect(second.status).toBe(429);
+
+      const budget = alerts.find((a) => a.alert === 'token_budget_exceeded');
+      expect(budget).toBeDefined();
+      expect(budget?.details.limitTokens).toBe(5000);
+    } finally {
+      delete process.env.AI_DAILY_TOKEN_BUDGET;
+      resetTokenBudget();
+    }
+  });
+
+  it('alerts when the circuit opens against the provider', async () => {
+    stubFetch(async () => new Response('down', { status: 500 }));
+
+    // Threshold is 5 failures; each request makes 2 attempts.
+    for (let i = 0; i < 3; i += 1) await handleChat(makeRequest(VALID_BODY, ip(11)));
+
+    const response = await handleChat(makeRequest(VALID_BODY, ip(11)));
+    expect(response.status).toBe(503);
+
+    const alert = alerts.find((a) => a.alert === 'upstream_circuit_open');
+    expect(alert).toBeDefined();
+    expect(typeof alert?.details.retryAfterSeconds).toBe('number');
+  });
+
+  it('alerts when a request exceeds the aggregate input ceiling', async () => {
+    const oversized = {
+      messages: [{ role: 'user' as const, content: 'x'.repeat(MAX_TOTAL_INPUT_CHARS + 1) }],
+      stream: false,
+    };
+
+    const response = await handleChat(makeRequest(oversized, ip(12)));
+    expect(response.status).toBe(400);
+
+    const alert = alerts.find((a) => a.alert === 'oversized_request_rejected');
+    expect(alert).toBeDefined();
+    expect(alert?.details.limit).toBe(MAX_TOTAL_INPUT_CHARS);
+  });
+
+  it('does not alert for an ordinary validation failure', async () => {
+    const response = await handleChat(makeRequest({ messages: 'not-an-array' }, ip(13)));
+    expect(response.status).toBe(400);
+
+    expect(alerts.filter((a) => a.alert === 'oversized_request_rejected')).toEqual([]);
+  });
+
+  it('alerts when a caller asks for a model outside the allowlist', async () => {
+    process.env.OPENROUTER_ALLOWED_MODELS = 'openai/gpt-4o-mini';
+
+    try {
+      const response = await handleChat(
+        makeRequest({ ...VALID_BODY, model: 'anthropic/claude-opus-4' }, ip(14))
+      );
+      expect(response.status).toBe(403);
+
+      const alert = alerts.find((a) => a.alert === 'model_not_allowed');
+      expect(alert).toBeDefined();
+      expect(alert?.details.requested).toBe('anthropic/claude-opus-4');
+    } finally {
+      delete process.env.OPENROUTER_ALLOWED_MODELS;
+    }
   });
 });
