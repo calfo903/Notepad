@@ -27,6 +27,9 @@ missing, recreate it with at least:
 | `SESSION_SECRET` | Edge Functions | Signs the session cookie (HS256). Minimum 32 bytes; `server/session.ts` refuses to start auth below that. |
 | `DATABASE_URL` | Edge Functions | Pooled Postgres. Without it, sync/search/history/deletion all return 503 and the app stays local-only. |
 | `OPENROUTER_API_KEY` | `api/chat.ts` | Required when `VITE_AI_PROVIDER=openrouter` (the default). |
+| `AI_DAILY_TOKEN_BUDGET` | `server/costGuard.ts` | Per-principal token budget per UTC day. Default 500000. Exceeding it returns `429 BUDGET_EXCEEDED`. |
+| `LOG_SALT` | `server/aiLog.ts`, `server/db/accountRepo.ts` | Salts the principal hash in request logs **and** the audit pseudonym written on account deletion. Without it both are reproducible from the source. |
+| `OPENROUTER_FALLBACK_MODELS` | `server/chatHandler.ts` | Comma-separated models tried after the primary, filtered against the allowlist. |
 
 Generate a session secret with:
 
@@ -130,6 +133,19 @@ a GIN trigram index can accelerate on real Postgres), with a fuzzy tier for
 typos. The `notes_search_trgm_idx` index is kept for real Postgres but does
 nothing measurable under PGlite.
 
+### Prompt evaluation
+
+`npm run eval` scores 15 attack and benign cases against the real
+`hardenMessages`. No network, no API key, no cost — it runs in CI on changes to
+`server/promptGuard.ts`, `chatHandler.ts`, `schema.ts` or `server/eval/**`.
+
+It is not decorative. Stubbing `stripDelimiters` to a no-op makes it report
+13/15 and exit 1, naming the forged delimiters that survived.
+
+`npm run eval:live` scores real provider output and needs `OPENROUTER_API_KEY`.
+That tier is the only thing that can tell you whether a *model* obeys the guard;
+passing the deterministic tier means the prompt is well-formed, nothing more.
+
 ## Migrations
 
 `server/db/migrations/`:
@@ -174,14 +190,32 @@ enabling `VITE_AI_PROVIDER=puter`: that path sends note content straight from th
 browser to Puter and bypasses the prompt guard, the token budget and the request
 log entirely.
 
+## Governance documents
+
+| Document | What it answers |
+| --- | --- |
+| [docs/data-flows.md](docs/data-flows.md) | What leaves the device, where it goes, how long it is kept |
+| [docs/subprocessors.md](docs/subprocessors.md) | Which third parties receive user data, and what each gets |
+| [docs/ai-usage.md](docs/ai-usage.md) | What the model can and cannot do, and which control enforces it |
+| [docs/privacy-policy.draft.md](docs/privacy-policy.draft.md) | Draft privacy notice — **not** reviewed by counsel |
+
+The privacy notice is a draft on purpose. It contains no named controller, no
+contact address and no lawful-basis analysis, because inventing those would make
+the document look finished when it is not.
+
 ## Known gaps
 
 - `src/hooks/useNotesStore.ts` has 0% test coverage. The hydration logic it calls
   (`src/utils/appStateSchema.ts`) is tested; the hook is not.
-- No PII detection before note content is sent to a model, and no per-note
-  "exclude from AI" flag.
 - Account deletion cannot clear the browser's `localStorage`; the client has to.
-- No privacy policy, ToS or provider DPA exists yet.
+- PII detection is a warning, not a filter, and it is regex-based — it will miss
+  a secret that does not match a known shape.
+- No terms of service, and no data processing agreement with any subprocessor.
+  The privacy notice is a draft awaiting legal review.
+- No output classifier or automated moderation. Prohibited use is enforced by
+  terms only.
+- The live eval tier has never been run against a real provider from this
+  environment, so model compliance with the guard is unverified.
 - The rate limiters are isolate-local, so each Edge isolate has its own bucket.
   A shared store (Upstash/Redis) is the seam that needs filling.
 - The editor is still `contentEditable`-based; migrating to ProseMirror or
