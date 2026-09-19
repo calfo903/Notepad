@@ -13,6 +13,14 @@ import {
   hashPrincipal,
   logAiInteraction,
 } from './aiLog';
+import {
+  CircuitBreaker,
+  CircuitOpenError,
+  backoffDelay,
+  delay,
+  getUpstreamBreaker,
+} from './circuitBreaker';
+import { parseFallbackModels } from './schema';
 import { errorResponse } from './http';
 import { hardenMessages } from './promptGuard';
 import { clientIp, createLimiterFromEnv } from './rateLimit';
@@ -30,6 +38,9 @@ import { AuthError } from './googleAuth';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const UPSTREAM_TIMEOUT_MS = 60_000;
+
+/** Base for jittered exponential backoff between upstream attempts. */
+const RETRY_BASE_MS = 250;
 
 const limiter = createLimiterFromEnv();
 
@@ -209,6 +220,81 @@ export async function handleChat(request: Request): Promise<Response> {
   return response;
 }
 
+type UpstreamAttempt =
+  | { readonly kind: 'ok'; readonly response: Response }
+  | { readonly kind: 'aborted' }
+  | { readonly kind: 'unreachable'; readonly message: string }
+  | { readonly kind: 'open'; readonly retryAfterMs: number };
+
+/**
+ * Call the provider with one bounded retry.
+ *
+ * Retries only what can plausibly succeed on a second try: a network failure or
+ * a 5xx/429. A 4xx is the client's or our own mistake and retrying it just
+ * doubles the bill. Nothing is retried once a stream has begun, because the
+ * caller cannot un-see the bytes already delivered.
+ */
+async function callUpstream(
+  payload: unknown,
+  apiKey: string,
+  traceId: string,
+  signal: AbortSignal,
+  breaker: CircuitBreaker,
+  attempts = 2,
+  sleep: (ms: number) => Promise<void> = delay,
+  random: () => number = Math.random
+): Promise<UpstreamAttempt> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      breaker.enter();
+    } catch (err) {
+      if (err instanceof CircuitOpenError) return { kind: 'open', retryAfterMs: err.retryAfterMs };
+      throw err;
+    }
+
+    try {
+      const response = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+          // OpenRouter attribution headers; site is optional but improves routing.
+          'HTTP-Referer': process.env.APP_BASE_URL ?? 'https://noteflow.local',
+          'X-Title': 'NoteFlow AI',
+          // Correlates our log line with the provider's own request record.
+          'X-Request-Id': traceId,
+        },
+        body: JSON.stringify(payload),
+        signal,
+      });
+
+      if (response.ok) {
+        breaker.succeed();
+        return { kind: 'ok', response };
+      }
+
+      // 5xx and 429 are transient; anything else is a permanent rejection.
+      const retryable = response.status >= 500 || response.status === 429;
+      breaker.fail();
+
+      if (!retryable || attempt === attempts - 1) return { kind: 'ok', response };
+
+      await sleep(backoffDelay(attempt, RETRY_BASE_MS, random));
+    } catch (err) {
+      if (signal.aborted) return { kind: 'aborted' };
+
+      breaker.fail();
+      const message = err instanceof Error ? err.message : 'Upstream request failed';
+
+      if (attempt === attempts - 1) return { kind: 'unreachable', message };
+      await sleep(backoffDelay(attempt, RETRY_BASE_MS, random));
+    }
+  }
+
+  // Unreachable: the loop always returns on its final iteration.
+  return { kind: 'unreachable', message: 'Upstream attempts exhausted' };
+}
+
 async function handleChatInternal(
   request: Request,
   traceId: string,
@@ -328,6 +414,13 @@ async function handleChatInternal(
 
   const upstreamPayload = {
     model,
+    // OpenRouter routes to the first available model in `models` when the
+    // primary is unavailable, so an outage on one model does not take the
+    // feature down. See DEVELOPMENT.md for the caveat on this parameter.
+    ...(() => {
+      const fallbacks = parseFallbackModels(model);
+      return fallbacks.length > 0 ? { models: [model, ...fallbacks] } : {};
+    })(),
     messages,
     stream: body.stream,
     ...(body.temperature === undefined ? {} : { temperature: body.temperature }),
@@ -339,6 +432,7 @@ async function handleChatInternal(
 
   // Reserve against the daily token budget before spending. The estimate covers
   // input plus the worst-case output; `record` reconciles it afterwards.
+  const breaker = getUpstreamBreaker();
   const budget = getTokenBudget();
   const estimatedInput = estimateTokens(meta.inputChars);
   const budgetDecision = await budget.check(bucketKey, estimatedInput + maxTokens);
@@ -373,31 +467,31 @@ async function handleChatInternal(
 
   const linked = combinedSignal(request.signal, UPSTREAM_TIMEOUT_MS);
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(OPENROUTER_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-        // OpenRouter attribution headers; site is optional but improves routing.
-        'HTTP-Referer': process.env.APP_BASE_URL ?? 'https://noteflow.local',
-        'X-Title': 'NoteFlow AI',
-        // Correlates our log line with the provider's own request record.
-        'X-Request-Id': traceId,
-      },
-      body: JSON.stringify(upstreamPayload),
-      signal: linked.signal,
-    });
-  } catch (err) {
+  const attempt = await callUpstream(upstreamPayload, apiKey, traceId, linked.signal, breaker);
+
+  if (attempt.kind === 'open') {
     linked.dispose();
-    if (linked.signal.aborted) {
-      return fail(499, 'CLIENT_ABORTED', 'Request was cancelled.', undefined, limitHeaders);
-    }
-    const message = err instanceof Error ? err.message : 'Upstream request failed';
-    console.error('[api/chat] upstream fetch failed:', message);
+    return fail(
+      503,
+      'PROVIDER_CIRCUIT_OPEN',
+      'The AI provider is temporarily unavailable. Try again shortly.',
+      undefined,
+      { ...limitHeaders, 'retry-after': String(Math.ceil(attempt.retryAfterMs / 1_000)) }
+    );
+  }
+
+  if (attempt.kind === 'aborted') {
+    linked.dispose();
+    return fail(499, 'CLIENT_ABORTED', 'Request was cancelled.', undefined, limitHeaders);
+  }
+
+  if (attempt.kind === 'unreachable') {
+    linked.dispose();
+    console.error('[api/chat] upstream fetch failed:', attempt.message);
     return fail(502, 'UPSTREAM_UNREACHABLE', 'Could not reach the AI provider.', undefined, limitHeaders);
   }
+
+  const upstream = attempt.response;
 
   if (!upstream.ok) {
     linked.dispose();

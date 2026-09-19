@@ -121,3 +121,30 @@ export function resolveModel(
   if (!allowlist.includes(normalised)) throw new ModelNotAllowedError(requested);
   return normalised;
 }
+
+/**
+ * Fallback models for provider-side failover.
+ *
+ * OpenRouter accepts a `models` array and routes to the first available entry,
+ * which gives outage tolerance without a second provider integration or a second
+ * API key. The requested model is always first, so this only changes behaviour
+ * when the primary is unavailable.
+ *
+ * Configured as a comma-separated `OPENROUTER_FALLBACK_MODELS`. Entries outside
+ * the allowlist are dropped — a failover path must not become a way to reach a
+ * model the deployment has not approved.
+ */
+export function parseFallbackModels(
+  primary: string,
+  env: Record<string, string | undefined> = process.env
+): readonly string[] {
+  const allowlist = parseAllowlist(env.OPENROUTER_ALLOWED_MODELS);
+  const requested = (env.OPENROUTER_FALLBACK_MODELS ?? '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.length > 0);
+
+  const approved = requested.filter((entry) => allowlist.includes(entry));
+  // De-duplicate and drop the primary itself.
+  return [...new Set(approved)].filter((entry) => entry !== primary);
+}

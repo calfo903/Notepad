@@ -2,6 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { handleChat } from './chatHandler';
 import { resetTokenBudget } from './costGuard';
+import { resetUpstreamBreaker } from './circuitBreaker';
 import { DEFAULT_MAX_TOKENS, HARD_MAX_TOKENS } from './schema';
 
 const KEY = 'sk-or-test-key-not-a-real-secret';
@@ -89,6 +90,9 @@ beforeEach(() => {
   // asserted separately below.
   process.env.REQUIRE_AUTH_FOR_AI = 'false';
   resetTokenBudget();
+  // The breaker is a process-wide singleton; a 5xx in one test must not make the
+  // next test see an open circuit.
+  resetUpstreamBreaker();
 });
 
 afterEach(() => {
@@ -98,7 +102,9 @@ afterEach(() => {
   delete process.env.OPENROUTER_ALLOWED_MODELS;
   delete process.env.REQUIRE_AUTH_FOR_AI;
   delete process.env.AI_DAILY_TOKEN_BUDGET;
+  delete process.env.OPENROUTER_FALLBACK_MODELS;
   resetTokenBudget();
+  resetUpstreamBreaker();
 });
 
 describe('handleChat', () => {
