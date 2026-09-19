@@ -166,10 +166,22 @@ extension privileges on your database.
   concurrently lose the older revision. Fixing that needs a CRDT or an operation
   log; it is a known limitation, not an oversight.
 
+## Data flows and privacy
+
+See [docs/data-flows.md](docs/data-flows.md) for what leaves the device, which
+third parties receive it, and how long each store is kept. Read it before
+enabling `VITE_AI_PROVIDER=puter`: that path sends note content straight from the
+browser to Puter and bypasses the prompt guard, the token budget and the request
+log entirely.
+
 ## Known gaps
 
 - `src/hooks/useNotesStore.ts` has 0% test coverage. The hydration logic it calls
   (`src/utils/appStateSchema.ts`) is tested; the hook is not.
+- No PII detection before note content is sent to a model, and no per-note
+  "exclude from AI" flag.
+- Account deletion cannot clear the browser's `localStorage`; the client has to.
+- No privacy policy, ToS or provider DPA exists yet.
 - The rate limiters are isolate-local, so each Edge isolate has its own bucket.
   A shared store (Upstash/Redis) is the seam that needs filling.
 - The editor is still `contentEditable`-based; migrating to ProseMirror or

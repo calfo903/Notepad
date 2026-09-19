@@ -19,6 +19,8 @@ import { errorResponse, jsonResponse, readJsonBody } from './http';
 import { clientIp, RateLimiter } from './rateLimit';
 import { getDatabase } from './db/client';
 import { tryRecordAuthEvent } from './accountHandler';
+import { pruneAuthEvents } from './db/accountRepo';
+import { DatabaseNotConfiguredError } from './db/client';
 
 /**
  * Authentication endpoints.
@@ -157,6 +159,16 @@ export function createGoogleLoginHandler(deps: GoogleLoginDeps = {}) {
       event: 'sign_in',
       request,
     });
+
+    // Retention, applied opportunistically: Edge Functions have no cron, so the
+    // window is enforced on the way past rather than by a scheduler.
+    try {
+      await pruneAuthEvents(getDatabase());
+    } catch (err) {
+      if (!(err instanceof DatabaseNotConfiguredError)) {
+        console.error('[auth] failed to prune expired audit events:', err instanceof Error ? err.message : err);
+      }
+    }
 
     return jsonResponse(
       200,

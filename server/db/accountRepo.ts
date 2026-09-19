@@ -102,6 +102,65 @@ export async function deleteAccountData(db: Database, userId: string): Promise<D
   return { notes: deletedNotes.length, folders: deletedFolders.length };
 }
 
+/**
+ * Remove the personal data from a user's audit trail while keeping the timeline.
+ *
+ * Called on account deletion. The rows stay — an audit log that can be deleted by
+ * the account it describes is not an audit log — but `user_id` is replaced with a
+ * salted hash and the IP and user agent are dropped, so what remains evidences
+ * *that* an account signed in and was deleted without identifying anyone.
+ *
+ * The hash is not reversible from the table alone: recovering the mapping needs
+ * the original `sub`, which the deletion just removed.
+ */
+export async function pseudonymiseAuthEvents(
+  db: Database,
+  userId: string
+): Promise<number> {
+  const token = `deleted:${await pseudonym(userId)}`;
+
+  const updated = await db
+    .update(authEvents)
+    .set({ userId: token, ip: null, userAgent: null })
+    .where(eq(authEvents.userId, userId))
+    .returning({ id: authEvents.id });
+
+  return updated.length;
+}
+
+/** Salted, one-way identifier used in place of a real `user_id`. */
+async function pseudonym(userId: string): Promise<string> {
+  const salt = process.env.LOG_SALT?.trim() || 'noteflow-audit-pseudonymisation';
+  const bytes = new TextEncoder().encode(`${salt}:${userId}`);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 32);
+}
+
+/**
+ * Drop audit entries older than the retention window.
+ *
+ * An audit log with no expiry grows forever and keeps personal data indefinitely,
+ * which is the retention half of the GDPR problem. Called opportunistically on
+ * sign-in rather than on a scheduler, because Edge Functions have no cron to
+ * hang it on.
+ */
+export const AUTH_EVENT_RETENTION_MS = 365 * 24 * 60 * 60 * 1_000;
+
+export async function pruneAuthEvents(
+  db: Database,
+  olderThan: Date = new Date(Date.now() - AUTH_EVENT_RETENTION_MS)
+): Promise<number> {
+  const removed = await db
+    .delete(authEvents)
+    .where(sql`${authEvents.createdAt} < ${olderThan}`)
+    .returning({ id: authEvents.id });
+
+  return removed.length;
+}
+
 /** Closed set. Enforced here rather than as a DB enum so adding a value is a
  *  one-line code change and not a migration. */
 export const AUTH_EVENT_NAMES = ['sign_in', 'sign_out', 'account_deleted'] as const;

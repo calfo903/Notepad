@@ -287,18 +287,35 @@ describe('DELETE /api/auth/account', () => {
     expect(remaining.rows[0].n).toBe(0);
   });
 
-  it('records an account_deleted audit entry that survives the deletion', async () => {
+  it('evidences the deletion without retaining the identity it describes', async () => {
     await syncAll(harness.db, USER_SUB, { notes: [noteInput({ id: 'n1' })], folders: [], since: null });
 
-    await handlers().deleteAccount(request('/api/auth/account?confirm=true', 'DELETE'));
+    const response = await handlers().deleteAccount(request('/api/auth/account?confirm=true', 'DELETE'));
+    const body = (await response.json()) as { auditRowsPseudonymised: number };
 
+    expect(body.auditRowsPseudonymised).toBe(1);
+
+    // The event survives...
     const events = await harness.client.query<{ event: string }>(
-      `SELECT event FROM auth_events WHERE user_id = '${USER_SUB}'`
+      `SELECT event FROM auth_events WHERE event = 'account_deleted'`
     );
-    expect(events.rows.map((row) => row.event)).toContain('account_deleted');
+    expect(events.rows).toHaveLength(1);
+
+    // ...but under a pseudonym, not the real subject.
+    const owners = await harness.client.query<{ user_id: string }>(
+      `SELECT user_id FROM auth_events WHERE event = 'account_deleted'`
+    );
+    expect(owners.rows[0].user_id).toMatch(/^deleted:[0-9a-f]{32}$/);
+    expect(owners.rows[0].user_id).not.toBe(USER_SUB);
+
+    // And nothing in the table still identifies the user.
+    const remaining = await harness.client.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM auth_events WHERE user_id = '${USER_SUB}'`
+    );
+    expect(remaining.rows[0].n).toBe(0);
   });
 
-  it('captures the client IP in the audit entry', async () => {
+  it('drops the client IP once the account is deleted', async () => {
     const response = await handlers().deleteAccount(
       request('/api/auth/account?confirm=true', 'DELETE', {
         headers: { 'x-forwarded-for': '198.51.100.4, 10.0.0.1' },
@@ -306,9 +323,24 @@ describe('DELETE /api/auth/account', () => {
     );
 
     expect(response.status).toBe(200);
-    const rows = await harness.client.query<{ ip: string | null }>(
-      `SELECT ip FROM auth_events WHERE user_id = '${USER_SUB}' AND event = 'account_deleted'`
+
+    const rows = await harness.client.query<{ ip: string | null; user_agent: string | null }>(
+      `SELECT ip, user_agent FROM auth_events WHERE event = 'account_deleted'`
     );
-    expect(rows.rows[0].ip).toBe('198.51.100.4');
+    expect(rows.rows[0].ip).toBeNull();
+    expect(rows.rows[0].user_agent).toBeNull();
+  });
+
+  it('keeps the IP on the audit trail of an account that still exists', async () => {
+    // The pseudonymisation is scoped to deletion, not applied globally.
+    await harness.client.exec(
+      `INSERT INTO auth_events (id, user_id, event, ip, created_at)
+       VALUES ('keep-1', '${USER_SUB}', 'sign_in', '203.0.113.9', now())`
+    );
+
+    const events = await handlers().events(request('/api/auth/events', 'GET'));
+    const body = (await events.json()) as { events: { ip: string | null }[] };
+
+    expect(body.events[0].ip).toBe('203.0.113.9');
   });
 });

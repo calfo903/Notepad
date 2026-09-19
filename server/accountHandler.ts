@@ -4,6 +4,7 @@ import {
   MAX_SEARCH_LIMIT,
   deleteAccountData,
   listAuthEvents,
+  pseudonymiseAuthEvents,
   recordAuthEvent,
   searchNotes,
   type AuthEventName,
@@ -223,15 +224,25 @@ export function createDeleteAccountHandler(deps: AccountHandlerDeps = {}) {
       const db = resolveDb();
       const deleted = await deleteAccountData(db, user.sub);
 
-      // Best-effort: the deletion already happened, so a failed audit write must
-      // not make it look like the account survived.
+      // Record the deletion first, while the row still carries the real id, then
+      // pseudonymise — including the entry just written. What remains evidences
+      // the deletion without retaining the identity it describes.
       await recordAuthEventSafely(db, {
         userId: user.sub,
         event: 'account_deleted',
         request,
       });
 
-      return jsonResponse(200, { deleted });
+      let pseudonymised = 0;
+      try {
+        pseudonymised = await pseudonymiseAuthEvents(db, user.sub);
+      } catch (err) {
+        // The account data is already gone; a failure here must not report the
+        // deletion as failed. Logged loudly because it is a retention defect.
+        console.error('[account] failed to pseudonymise audit trail:', err instanceof Error ? err.message : err);
+      }
+
+      return jsonResponse(200, { deleted, auditRowsPseudonymised: pseudonymised });
     } catch (err) {
       if (err instanceof DatabaseNotConfiguredError) {
         console.error('[account] database is not configured');

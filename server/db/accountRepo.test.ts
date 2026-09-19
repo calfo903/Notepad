@@ -4,8 +4,11 @@ import { eq } from 'drizzle-orm';
 import { authEvents, notes } from './schema';
 import { createTestDatabase, type TestDatabase } from './testDatabase';
 import {
+  AUTH_EVENT_RETENTION_MS,
   deleteAccountData,
   listAuthEvents,
+  pruneAuthEvents,
+  pseudonymiseAuthEvents,
   recordAuthEvent,
   searchNotes,
 } from './accountRepo';
@@ -329,5 +332,96 @@ describe('audit log', () => {
     const events = await listAuthEvents(db, USER_A);
     expect(events.map((event) => event.event)).toContain('account_deleted');
     expect(await db.select().from(authEvents).where(eq(authEvents.userId, USER_A))).toHaveLength(2);
+  });
+});
+
+describe('pseudonymiseAuthEvents', () => {
+  it('replaces the subject with a salted hash and drops IP and user agent', async () => {
+    await recordAuthEvent(db, {
+      userId: USER_A,
+      event: 'sign_in',
+      ip: '203.0.113.7',
+      userAgent: 'Mozilla/5.0',
+    });
+
+    const count = await pseudonymiseAuthEvents(db, USER_A);
+
+    expect(count).toBe(1);
+    const rows = await harness.client.query<{ user_id: string; ip: string | null; user_agent: string | null }>(
+      `SELECT user_id, ip, user_agent FROM auth_events`
+    );
+    expect(rows.rows[0].user_id).toMatch(/^deleted:[0-9a-f]{32}$/);
+    expect(rows.rows[0].ip).toBeNull();
+    expect(rows.rows[0].user_agent).toBeNull();
+  });
+
+  it('keeps the event and timestamp, so the timeline survives', async () => {
+    await recordAuthEvent(db, { userId: USER_A, event: 'sign_in' });
+    await recordAuthEvent(db, { userId: USER_A, event: 'sign_out' });
+
+    await pseudonymiseAuthEvents(db, USER_A);
+
+    const rows = await harness.client.query<{ event: string; created_at: Date }>(
+      `SELECT event, created_at FROM auth_events ORDER BY event`
+    );
+    expect(rows.rows.map((row) => row.event)).toEqual(['sign_in', 'sign_out']);
+    expect(rows.rows.every((row) => row.created_at instanceof Date)).toBe(true);
+  });
+
+  it('is deterministic, so repeated calls do not fork the identity', async () => {
+    await recordAuthEvent(db, { userId: USER_A, event: 'sign_in' });
+
+    await pseudonymiseAuthEvents(db, USER_A);
+    const first = await harness.client.query<{ user_id: string }>(`SELECT user_id FROM auth_events`);
+
+    // A second call finds nothing under the original id.
+    expect(await pseudonymiseAuthEvents(db, USER_A)).toBe(0);
+    const second = await harness.client.query<{ user_id: string }>(`SELECT user_id FROM auth_events`);
+
+    expect(second.rows[0].user_id).toBe(first.rows[0].user_id);
+  });
+
+  it('does not touch other users', async () => {
+    await recordAuthEvent(db, { userId: USER_A, event: 'sign_in', ip: '203.0.113.1' });
+    await recordAuthEvent(db, { userId: USER_B, event: 'sign_in', ip: '203.0.113.2' });
+
+    await pseudonymiseAuthEvents(db, USER_A);
+
+    const kept = await listAuthEvents(db, USER_B);
+    expect(kept).toHaveLength(1);
+    expect(kept[0].ip).toBe('203.0.113.2');
+  });
+});
+
+describe('pruneAuthEvents', () => {
+  it('removes entries older than the window and keeps recent ones', async () => {
+    const now = Date.now();
+    await harness.client.exec(
+      `INSERT INTO auth_events (id, user_id, event, created_at) VALUES
+        ('old', '${USER_A}', 'sign_in', to_timestamp(${(now - AUTH_EVENT_RETENTION_MS - 1_000) / 1_000})),
+        ('new', '${USER_A}', 'sign_in', to_timestamp(${now / 1_000}))`
+    );
+
+    const removed = await pruneAuthEvents(db);
+
+    expect(removed).toBe(1);
+    const rows = await harness.client.query<{ id: string }>(`SELECT id FROM auth_events`);
+    expect(rows.rows.map((row) => row.id)).toEqual(['new']);
+  });
+
+  it('honours a custom cutoff', async () => {
+    await recordAuthEvent(db, { userId: USER_A, event: 'sign_in' });
+
+    expect(await pruneAuthEvents(db, new Date(Date.now() + 1_000))).toBe(1);
+    expect(await listAuthEvents(db, USER_A)).toHaveLength(0);
+  });
+
+  it('is a no-op when nothing has expired', async () => {
+    await recordAuthEvent(db, { userId: USER_A, event: 'sign_in' });
+    expect(await pruneAuthEvents(db)).toBe(0);
+  });
+
+  it('has a retention window of one year', () => {
+    expect(AUTH_EVENT_RETENTION_MS).toBe(365 * 24 * 60 * 60 * 1_000);
   });
 });

@@ -1,8 +1,10 @@
-import { memo, useState, useRef, useEffect, useCallback } from 'react';
+import { memo, useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { AIMessage, AIMemory, AIQuickAction, AIGenerateType } from '../types';
 import { cn } from '../utils/helpers';
 import { renderInlineMarkdown, sanitizeHtml } from '../utils/sanitize';
 import { Icons } from './icons';
+import { AiDisclosure } from './AiDisclosure';
+import { getProvider } from '../services/ai/registry';
 
 interface AIPanelProps {
   isOpen: boolean;
@@ -62,6 +64,9 @@ export const AIPanel = memo(function AIPanel({
   onSetPreference,
   onInsertContent,
 }: AIPanelProps) {
+  // Resolved once; the registry memoises instances, so this is a map lookup.
+  const providerLabel = useMemo(() => getProvider().label, []);
+
   const [inputValue, setInputValue] = useState('');
   const [activeTab, setActiveTab] = useState<TabType>('chat');
   const [showLanguages, setShowLanguages] = useState(false);
@@ -181,7 +186,7 @@ export const AIPanel = memo(function AIPanel({
               NoteFlow AI
             </h3>
             <p className="text-xs text-text-secondary dark:text-text-secondary-dark">
-              Powered by Puter
+              Powered by {providerLabel}
             </p>
           </div>
         </div>
@@ -193,6 +198,8 @@ export const AIPanel = memo(function AIPanel({
           <Icons.Close className="w-5 h-5" />
         </button>
       </header>
+
+      <AiDisclosure providerLabel={providerLabel} />
 
       {/* Tabs */}
       <div className="flex border-b border-border dark:border-white/5 flex-shrink-0">
