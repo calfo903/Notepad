@@ -1,0 +1,45 @@
+name: CodeQL
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  schedule:
+    # Weekly, so a newly published query catches existing code and not just diffs.
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for CodeQL to publish SARIF results.
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          # security-and-quality catches the taint-flow queries that matter for
+          # an app that renders model output into a contentEditable surface.
+          queries: security-and-quality
+
+      # No build step: the JavaScript/TypeScript analyser extracts from source.
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript-typescript'

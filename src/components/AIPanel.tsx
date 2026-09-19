@@ -1,7 +1,11 @@
-import { memo, useState, useRef, useEffect, useCallback } from 'react';
+import { memo, useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { AIMessage, AIMemory, AIQuickAction, AIGenerateType } from '../types';
 import { cn } from '../utils/helpers';
+import { renderInlineMarkdown, sanitizeHtml } from '../utils/sanitize';
 import { Icons } from './icons';
+import { AiDisclosure } from './AiDisclosure';
+import { describeFindings, detectSensitiveContent } from '../utils/pii';
+import { getProvider } from '../services/ai/registry';
 
 interface AIPanelProps {
   isOpen: boolean;
@@ -11,10 +15,15 @@ interface AIPanelProps {
   streamingResponse: string;
   noteContent?: string;
   noteTitle?: string;
+  /** When true the note's content is withheld from the provider. */
+  noteExcludedFromAi?: boolean;
+  onToggleExcludeFromAi?: (value: boolean) => void;
   onClose: () => void;
   onChat: (message: string, options?: { noteContent?: string; noteTitle?: string; stream?: boolean }) => Promise<string>;
   onQuickAction: (action: AIQuickAction, content: string, extraParams?: { language?: string; tone?: string }) => Promise<string>;
   onGenerateContent: (type: AIGenerateType, topic: string, existingContent?: string) => Promise<string>;
+  onRegenerate?: () => Promise<string> | void;
+  onFeedback?: (messageId: string, feedback: 'up' | 'down') => void;
   onStopGeneration: () => void;
   onClearHistory: () => void;
   onSetPreference: (key: 'writingStyle' | 'topics' | 'language', value: string | string[]) => void;
@@ -52,15 +61,34 @@ export const AIPanel = memo(function AIPanel({
   streamingResponse,
   noteContent,
   noteTitle,
+  noteExcludedFromAi = false,
+  onToggleExcludeFromAi,
   onClose,
   onChat,
   onQuickAction,
   onGenerateContent,
+  onRegenerate,
+  onFeedback,
   onStopGeneration,
   onClearHistory,
   onSetPreference,
   onInsertContent,
 }: AIPanelProps) {
+  // Resolved once; the registry memoises instances, so this is a map lookup.
+  const providerLabel = useMemo(() => getProvider().label, []);
+
+  // The single place that decides what leaves the device. Every send path reads
+  // this rather than `noteContent`, so the opt-out cannot be bypassed by a new
+  // call site added later.
+  const sendableNoteContent = noteExcludedFromAi ? undefined : noteContent;
+
+  // Warning, not a filter: a regex cannot reliably tell a card number from an
+  // order reference, so the user decides. The matched values are never rendered.
+  const sensitiveWarning = useMemo(
+    () => describeFindings(detectSensitiveContent(sendableNoteContent ?? '')),
+    [sendableNoteContent]
+  );
+
   const [inputValue, setInputValue] = useState('');
   const [activeTab, setActiveTab] = useState<TabType>('chat');
   const [showLanguages, setShowLanguages] = useState(false);
@@ -86,9 +114,9 @@ export const AIPanel = memo(function AIPanel({
     if (!inputValue.trim() || isLoading) return;
     const message = inputValue;
     setInputValue('');
-    const response = await onChat(message, { noteContent, noteTitle, stream: true });
+    const response = await onChat(message, { noteContent: sendableNoteContent, noteTitle, stream: true });
     setLastResponse(response);
-  }, [inputValue, isLoading, noteContent, noteTitle, onChat]);
+  }, [inputValue, isLoading, sendableNoteContent, noteTitle, onChat]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -102,53 +130,56 @@ export const AIPanel = memo(function AIPanel({
 
   const handleQuickAction = useCallback(
     async (action: AIQuickAction) => {
-      if (!noteContent?.trim()) {
+      if (!sendableNoteContent?.trim()) {
         alert('Please add some content to your note first.');
         return;
       }
-      const response = await onQuickAction(action, noteContent);
+      const response = await onQuickAction(action, sendableNoteContent);
       setLastResponse(response);
     },
-    [noteContent, onQuickAction]
+    [sendableNoteContent, onQuickAction]
   );
 
   const handleTranslate = useCallback(
     async (language: string) => {
       setShowLanguages(false);
-      if (!noteContent?.trim()) {
+      if (!sendableNoteContent?.trim()) {
         alert('Please add some content to your note first.');
         return;
       }
-      const response = await onQuickAction('translate', noteContent, { language });
+      const response = await onQuickAction('translate', sendableNoteContent, { language });
       setLastResponse(response);
     },
-    [noteContent, onQuickAction]
+    [sendableNoteContent, onQuickAction]
   );
 
   const handleToneChange = useCallback(
     async (tone: string) => {
       setShowTones(false);
-      if (!noteContent?.trim()) {
+      if (!sendableNoteContent?.trim()) {
         alert('Please add some content to your note first.');
         return;
       }
-      const response = await onQuickAction('tone', noteContent, { tone });
+      const response = await onQuickAction('tone', sendableNoteContent ?? '', { tone });
       setLastResponse(response);
     },
-    [noteContent, onQuickAction]
+    [sendableNoteContent, onQuickAction]
   );
 
   const handleGenerate = useCallback(
     async (type: AIGenerateType) => {
-      const topic = type === 'continue' ? noteContent : noteTitle || inputValue || 'general topic';
+      const topic =
+        type === 'continue'
+          ? (sendableNoteContent ?? '')
+          : noteTitle || inputValue || 'general topic';
       if (!topic?.trim() && type !== 'continue') {
         alert('Please enter a topic or give your note a title.');
         return;
       }
-      const response = await onGenerateContent(type, topic || '', noteContent);
+      const response = await onGenerateContent(type, topic || '', sendableNoteContent ?? '');
       setLastResponse(response);
     },
-    [inputValue, noteContent, noteTitle, onGenerateContent]
+    [inputValue, sendableNoteContent, noteTitle, onGenerateContent]
   );
 
   const handleInsert = useCallback(() => {
@@ -157,13 +188,13 @@ export const AIPanel = memo(function AIPanel({
     }
   }, [lastResponse, onInsertContent]);
 
-  const formatMessage = useCallback((content: string) => {
-    return content
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/`(.*?)`/g, '<code class="bg-black/10 dark:bg-white/10 px-1 rounded text-sm">$1</code>')
-      .replace(/\n/g, '<br/>');
-  }, []);
+  // LLM output is untrusted input. Escape-then-format renders Markdown syntax
+  // while leaving any markup in the response inert; sanitizeHtml is applied on
+  // top as defence in depth so no tag outside the policy can reach the DOM.
+  const formatMessage = useCallback(
+    (content: string) => sanitizeHtml(renderInlineMarkdown(content)),
+    []
+  );
 
   if (!isOpen) return null;
 
@@ -180,7 +211,7 @@ export const AIPanel = memo(function AIPanel({
               NoteFlow AI
             </h3>
             <p className="text-xs text-text-secondary dark:text-text-secondary-dark">
-              Powered by Puter
+              Powered by {providerLabel}
             </p>
           </div>
         </div>
@@ -192,6 +223,44 @@ export const AIPanel = memo(function AIPanel({
           <Icons.Close className="w-5 h-5" />
         </button>
       </header>
+
+      <AiDisclosure providerLabel={providerLabel} />
+
+      {onToggleExcludeFromAi && (
+        <label className="flex cursor-pointer items-start gap-2 border-b border-border-tertiary px-3 py-2 text-xs text-text-muted transition-colors hover:text-text-primary">
+          <input
+            type="checkbox"
+            role="switch"
+            checked={noteExcludedFromAi}
+            onChange={(event) => onToggleExcludeFromAi(event.target.checked)}
+            className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-accent"
+            aria-label="Exclude this note's content from AI"
+          />
+          <span>
+            Exclude this note from AI
+            <span className="block text-text-muted">
+              {noteExcludedFromAi
+                ? 'Nothing from this note is sent to the provider. You can still chat.'
+                : 'Note content is sent to the provider with your prompts.'}
+            </span>
+          </span>
+        </label>
+      )}
+
+      {noteExcludedFromAi ? (
+        <p className="bg-surface-secondary px-3 py-1.5 text-xs text-text-muted" role="status">
+          This note is excluded. Your messages are sent; the note content is not.
+        </p>
+      ) : (
+        sensitiveWarning && (
+          <p
+            className="border-b border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-900"
+            role="alert"
+          >
+            {sensitiveWarning}
+          </p>
+        )
+      )}
 
       {/* Tabs */}
       <div className="flex border-b border-border dark:border-white/5 flex-shrink-0">
@@ -232,25 +301,88 @@ export const AIPanel = memo(function AIPanel({
                 </div>
               )}
 
-              {memory.conversationHistory.map((msg: AIMessage) => (
-                <div
-                  key={msg.id}
-                  className={cn(
-                    'flex',
-                    msg.role === 'user' ? 'justify-end' : 'justify-start'
-                  )}
-                >
+              {memory.conversationHistory.map((msg: AIMessage, index: number) => {
+                const isLastAssistant =
+                  msg.role === 'assistant' &&
+                  index ===
+                    memory.conversationHistory.reduce(
+                      (last, candidate, candidateIndex) =>
+                        candidate.role === 'assistant' ? candidateIndex : last,
+                      -1
+                    );
+
+                return (
                   <div
+                    key={msg.id}
                     className={cn(
-                      'max-w-[85%] rounded-2xl px-4 py-2.5 text-sm',
-                      msg.role === 'user'
-                        ? 'bg-accent text-white rounded-br-md'
-                        : 'bg-gray-100 dark:bg-white/5 text-text-primary dark:text-text-primary-dark rounded-bl-md'
+                      'flex',
+                      msg.role === 'user' ? 'justify-end' : 'justify-start'
                     )}
-                    dangerouslySetInnerHTML={{ __html: formatMessage(msg.content) }}
-                  />
-                </div>
-              ))}
+                  >
+                    <div className="flex max-w-[85%] flex-col gap-1">
+                      {msg.role === 'assistant' && (
+                        // Attribution stays on the bubble rather than only in the
+                        // header, so a screenshot or a copied excerpt carries it.
+                        <span className="px-1 text-[10px] uppercase tracking-wide text-text-muted">
+                          {providerLabel}
+                        </span>
+                      )}
+                      <div
+                        className={cn(
+                          'rounded-2xl px-4 py-2.5 text-sm',
+                          msg.role === 'user'
+                            ? 'bg-accent text-white rounded-br-md'
+                            : 'bg-gray-100 dark:bg-white/5 text-text-primary dark:text-text-primary-dark rounded-bl-md'
+                        )}
+                        dangerouslySetInnerHTML={{ __html: formatMessage(msg.content) }}
+                      />
+                      {msg.role === 'assistant' && onFeedback && (
+                        <div className="flex items-center gap-1 px-1">
+                          <button
+                            type="button"
+                            onClick={() => onFeedback(msg.id, 'up')}
+                            aria-pressed={msg.feedback === 'up'}
+                            aria-label="Mark this response helpful"
+                            title="Helpful"
+                            className={cn(
+                              'rounded p-1 text-xs transition-colors',
+                              msg.feedback === 'up'
+                                ? 'bg-accent/20 text-accent'
+                                : 'text-text-muted hover:text-text-primary'
+                            )}
+                          >
+                            👍
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onFeedback(msg.id, 'down')}
+                            aria-pressed={msg.feedback === 'down'}
+                            aria-label="Mark this response unhelpful"
+                            title="Not helpful"
+                            className={cn(
+                              'rounded p-1 text-xs transition-colors',
+                              msg.feedback === 'down'
+                                ? 'bg-danger/20 text-danger'
+                                : 'text-text-muted hover:text-text-primary'
+                            )}
+                          >
+                            👎
+                          </button>
+                          {isLastAssistant && onRegenerate && !isLoading && (
+                            <button
+                              type="button"
+                              onClick={() => void onRegenerate()}
+                              className="ml-1 rounded px-1.5 py-1 text-[11px] text-text-muted transition-colors hover:text-text-primary"
+                            >
+                              Regenerate
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
 
               {streamingResponse && (
                 <div className="flex justify-start">

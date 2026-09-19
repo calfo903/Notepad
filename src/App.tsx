@@ -1,6 +1,8 @@
 import { useRef, useEffect, useCallback, useState, useMemo } from 'react';
 import { useNotesStore } from './hooks/useNotesStore';
 import { useAI } from './hooks/useAI';
+import { useAuth } from './hooks/useAuth';
+import { useSync } from './hooks/useSync';
 import { Sidebar } from './components/Sidebar';
 import { NoteList } from './components/NoteList';
 import { Toolbar } from './components/Toolbar';
@@ -8,12 +10,21 @@ import { NoteEditor } from './components/NoteEditor';
 import { RightPanel } from './components/RightPanel';
 import { AIPanel } from './components/AIPanel';
 import { cn, stripHtml, textToHtml, estimateReadTime } from './utils/helpers';
+import { sanitizeHtml } from './utils/sanitize';
 import { Icons } from './components/icons';
 import { SortBy } from './types';
 
 function App() {
   const store = useNotesStore();
   const ai = useAI();
+  const auth = useAuth();
+  // Sync only runs while authenticated; offline the app stays fully usable.
+  const sync = useSync({
+    isAuthenticated: auth.status === 'authenticated',
+    notes: store.state.notes,
+    folders: store.state.folders,
+    onApplyRemote: store.applyRemoteSync,
+  });
   const [showAIPanel, setShowAIPanel] = useState(false);
   const editorRef = useRef<HTMLDivElement | null>(null);
 
@@ -80,12 +91,16 @@ function App() {
     return () => window.removeEventListener('keydown', handler);
   }, [createNote, closeMobileOverlays, showAIPanel, setShowAIPanel]);
 
-  // Format command handler
+  // Format command handler.
+  // execCommand mutates the editor DOM directly, so the serialisation is
+  // sanitized before it becomes note state (and is later persisted/exported).
   const handleFormat = useCallback(
     (command: string, value?: string) => {
       document.execCommand(command, false, value);
       if (editorRef.current && state.activeNoteId) {
-        updateNote(state.activeNoteId, { content: editorRef.current.innerHTML });
+        updateNote(state.activeNoteId, {
+          content: sanitizeHtml(editorRef.current.innerHTML),
+        });
       }
     },
     [state.activeNoteId, updateNote]
@@ -98,18 +113,18 @@ function App() {
     }
   }, [activeNote, ai]);
 
-  // Handle inserting AI-generated content
+  // Handle inserting AI-generated content.
+  // `content` is raw LLM output: textToHtml escapes it into inert paragraphs,
+  // then the concatenated document is sanitized as a whole before it reaches
+  // either the editor DOM or persisted state.
   const handleInsertContent = useCallback(
     (content: string) => {
       if (!activeNote || !editorRef.current) return;
 
       const htmlContent = textToHtml(content);
-      const newContent = activeNote.content + htmlContent;
+      const newContent = sanitizeHtml(activeNote.content + htmlContent);
       updateNote(activeNote.id, { content: newContent });
-
-      if (editorRef.current) {
-        editorRef.current.innerHTML = newContent;
-      }
+      editorRef.current.innerHTML = newContent;
     },
     [activeNote, updateNote, editorRef]
   );
@@ -154,6 +169,8 @@ function App() {
           noteCounts={folderNoteCounts}
           searchQuery={state.searchQuery}
           isMobile={state.showMobileMenu}
+          auth={auth}
+          sync={sync}
           onFolderSelect={setActiveFolder}
           onToggleCollapse={toggleSidebar}
           onNewNote={createNote}
@@ -449,8 +466,21 @@ function App() {
         streamingResponse={ai.streamingResponse}
         noteContent={activeNote ? stripHtml(activeNote.content) : undefined}
         noteTitle={activeNote?.title}
+        noteExcludedFromAi={activeNote?.excludeFromAi === true}
+        onToggleExcludeFromAi={
+          activeNote
+            ? (value) => updateNote(activeNote.id, { excludeFromAi: value })
+            : undefined
+        }
         onClose={() => setShowAIPanel(false)}
         onChat={ai.chat}
+        onRegenerate={() =>
+          ai.regenerate({
+            noteContent: activeNote?.excludeFromAi ? undefined : activeNote ? stripHtml(activeNote.content) : undefined,
+            noteTitle: activeNote?.title,
+          })
+        }
+        onFeedback={ai.setFeedback}
         onQuickAction={ai.quickAction}
         onGenerateContent={ai.generateContent}
         onStopGeneration={ai.stopGeneration}

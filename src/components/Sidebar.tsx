@@ -2,6 +2,9 @@ import { memo, useCallback } from 'react';
 import { Folder } from '../types';
 import { cn } from '../utils/helpers';
 import { Icons } from './icons';
+import { AccountPanel } from './AccountPanel';
+import type { AuthStore } from '../hooks/useAuth';
+import type { SyncStore } from '../hooks/useSync';
 
 interface SidebarProps {
   folders: Folder[];
@@ -10,6 +13,8 @@ interface SidebarProps {
   noteCounts: Record<string, number>;
   searchQuery: string;
   isMobile?: boolean;
+  auth: AuthStore;
+  sync?: SyncStore;
   onFolderSelect: (folderId: string) => void;
   onToggleCollapse: () => void;
   onNewNote: () => void;
@@ -24,6 +29,8 @@ export const Sidebar = memo(function Sidebar({
   noteCounts,
   searchQuery,
   isMobile = false,
+  auth,
+  sync,
   onFolderSelect,
   onToggleCollapse,
   onNewNote,
@@ -190,6 +197,9 @@ export const Sidebar = memo(function Sidebar({
           <p className="text-xs text-text-secondary-dark/50 mt-1.5 hidden sm:block">
             Ctrl+N: New • Ctrl+J: AI
           </p>
+          <div className="mt-3 pt-3 border-t border-white/5">
+            <AccountPanel auth={auth} sync={sync} />
+          </div>
         </footer>
       )}
     </aside>
