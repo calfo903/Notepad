@@ -92,6 +92,8 @@ export interface AIMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: number;
+  /** Explicit user verdict, if they gave one. Absent means "not rated". */
+  feedback?: 'up' | 'down';
 }
 
 export interface AIMemory {

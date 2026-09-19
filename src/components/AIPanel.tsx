@@ -22,6 +22,8 @@ interface AIPanelProps {
   onChat: (message: string, options?: { noteContent?: string; noteTitle?: string; stream?: boolean }) => Promise<string>;
   onQuickAction: (action: AIQuickAction, content: string, extraParams?: { language?: string; tone?: string }) => Promise<string>;
   onGenerateContent: (type: AIGenerateType, topic: string, existingContent?: string) => Promise<string>;
+  onRegenerate?: () => Promise<string> | void;
+  onFeedback?: (messageId: string, feedback: 'up' | 'down') => void;
   onStopGeneration: () => void;
   onClearHistory: () => void;
   onSetPreference: (key: 'writingStyle' | 'topics' | 'language', value: string | string[]) => void;
@@ -65,6 +67,8 @@ export const AIPanel = memo(function AIPanel({
   onChat,
   onQuickAction,
   onGenerateContent,
+  onRegenerate,
+  onFeedback,
   onStopGeneration,
   onClearHistory,
   onSetPreference,
@@ -297,25 +301,88 @@ export const AIPanel = memo(function AIPanel({
                 </div>
               )}
 
-              {memory.conversationHistory.map((msg: AIMessage) => (
-                <div
-                  key={msg.id}
-                  className={cn(
-                    'flex',
-                    msg.role === 'user' ? 'justify-end' : 'justify-start'
-                  )}
-                >
+              {memory.conversationHistory.map((msg: AIMessage, index: number) => {
+                const isLastAssistant =
+                  msg.role === 'assistant' &&
+                  index ===
+                    memory.conversationHistory.reduce(
+                      (last, candidate, candidateIndex) =>
+                        candidate.role === 'assistant' ? candidateIndex : last,
+                      -1
+                    );
+
+                return (
                   <div
+                    key={msg.id}
                     className={cn(
-                      'max-w-[85%] rounded-2xl px-4 py-2.5 text-sm',
-                      msg.role === 'user'
-                        ? 'bg-accent text-white rounded-br-md'
-                        : 'bg-gray-100 dark:bg-white/5 text-text-primary dark:text-text-primary-dark rounded-bl-md'
+                      'flex',
+                      msg.role === 'user' ? 'justify-end' : 'justify-start'
                     )}
-                    dangerouslySetInnerHTML={{ __html: formatMessage(msg.content) }}
-                  />
-                </div>
-              ))}
+                  >
+                    <div className="flex max-w-[85%] flex-col gap-1">
+                      {msg.role === 'assistant' && (
+                        // Attribution stays on the bubble rather than only in the
+                        // header, so a screenshot or a copied excerpt carries it.
+                        <span className="px-1 text-[10px] uppercase tracking-wide text-text-muted">
+                          {providerLabel}
+                        </span>
+                      )}
+                      <div
+                        className={cn(
+                          'rounded-2xl px-4 py-2.5 text-sm',
+                          msg.role === 'user'
+                            ? 'bg-accent text-white rounded-br-md'
+                            : 'bg-gray-100 dark:bg-white/5 text-text-primary dark:text-text-primary-dark rounded-bl-md'
+                        )}
+                        dangerouslySetInnerHTML={{ __html: formatMessage(msg.content) }}
+                      />
+                      {msg.role === 'assistant' && onFeedback && (
+                        <div className="flex items-center gap-1 px-1">
+                          <button
+                            type="button"
+                            onClick={() => onFeedback(msg.id, 'up')}
+                            aria-pressed={msg.feedback === 'up'}
+                            aria-label="Mark this response helpful"
+                            title="Helpful"
+                            className={cn(
+                              'rounded p-1 text-xs transition-colors',
+                              msg.feedback === 'up'
+                                ? 'bg-accent/20 text-accent'
+                                : 'text-text-muted hover:text-text-primary'
+                            )}
+                          >
+                            👍
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onFeedback(msg.id, 'down')}
+                            aria-pressed={msg.feedback === 'down'}
+                            aria-label="Mark this response unhelpful"
+                            title="Not helpful"
+                            className={cn(
+                              'rounded p-1 text-xs transition-colors',
+                              msg.feedback === 'down'
+                                ? 'bg-danger/20 text-danger'
+                                : 'text-text-muted hover:text-text-primary'
+                            )}
+                          >
+                            👎
+                          </button>
+                          {isLastAssistant && onRegenerate && !isLoading && (
+                            <button
+                              type="button"
+                              onClick={() => void onRegenerate()}
+                              className="ml-1 rounded px-1.5 py-1 text-[11px] text-text-muted transition-colors hover:text-text-primary"
+                            >
+                              Regenerate
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
 
               {streamingResponse && (
                 <div className="flex justify-start">

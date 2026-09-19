@@ -75,6 +75,21 @@ export function useAI() {
     });
   }, []);
 
+  const setFeedback = useCallback((messageId: string, feedback: 'up' | 'down') => {
+    setMemory((prev) => {
+      const newHistory = prev.conversationHistory.map((message) =>
+        message.id === messageId
+          ? // Toggling the same verdict again clears it, which is what a user who
+            // clicked the wrong button expects.
+            { ...message, feedback: message.feedback === feedback ? undefined : feedback }
+          : message
+      );
+      const newMemory = { ...prev, conversationHistory: newHistory };
+      saveMemory(newMemory);
+      return newMemory;
+    });
+  }, []);
+
   const updateNoteContext = useCallback((noteTitle: string, tags: string[]) => {
     setMemory((prev) => {
       const recentNotes = [noteTitle, ...prev.noteContext.recentNotes.filter((n) => n !== noteTitle)].slice(
@@ -283,6 +298,39 @@ export function useAI() {
     updateMemory({ conversationHistory: [] });
   }, [updateMemory]);
 
+  /**
+   * Re-run the most recent exchange.
+   *
+   * The trailing assistant reply and its user turn are removed, then the same
+   * text is sent through `chat`, which re-appends it. Going back through `chat`
+   * rather than duplicating the request code means a regenerate cannot drift from
+   * a normal send — same hardening, same budget, same abort handling.
+   */
+  const regenerate = useCallback(
+    async (options?: { noteContent?: string; noteTitle?: string }): Promise<string> => {
+      // Read from the rendered `memory`, not from inside a state updater: the
+      // updater does not run until the next render, so anything assigned in it is
+      // still stale on the line below.
+      const history = memory.conversationHistory;
+      let index = history.length - 1;
+
+      // Step back over any assistant replies to the most recent user turn.
+      while (index >= 0 && history[index].role !== 'user') index -= 1;
+      if (index < 0) return '';
+
+      const lastUserContent = history[index].content;
+
+      setMemory((prev) => {
+        const newMemory = { ...prev, conversationHistory: history.slice(0, index) };
+        saveMemory(newMemory);
+        return newMemory;
+      });
+
+      return chat(lastUserContent, { ...options, stream: true });
+    },
+    [chat, memory.conversationHistory]
+  );
+
   return {
     memory,
     isLoading,
@@ -291,6 +339,8 @@ export function useAI() {
     providerId: provider.id,
     providerLabel: provider.label,
     chat,
+    regenerate,
+    setFeedback,
     quickAction,
     generateContent,
     stopGeneration,

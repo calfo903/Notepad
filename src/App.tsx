@@ -474,6 +474,13 @@ function App() {
         }
         onClose={() => setShowAIPanel(false)}
         onChat={ai.chat}
+        onRegenerate={() =>
+          ai.regenerate({
+            noteContent: activeNote?.excludeFromAi ? undefined : activeNote ? stripHtml(activeNote.content) : undefined,
+            noteTitle: activeNote?.title,
+          })
+        }
+        onFeedback={ai.setFeedback}
         onQuickAction={ai.quickAction}
         onGenerateContent={ai.generateContent}
         onStopGeneration={ai.stopGeneration}
